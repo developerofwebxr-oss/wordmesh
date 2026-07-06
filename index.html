@@ -156,7 +156,8 @@
 {
   "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
+    "socket.io-client": "https://cdn.jsdelivr.net/npm/socket.io-client@4.7.5/dist/socket.io.esm.min.js"
   }
 }
 </script>
@@ -167,6 +168,7 @@ import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+import { io } from "socket.io-client";
 
 /* ============================================================
    DataSource interface (locked seam — CLAUDE.md decision 5)
@@ -258,13 +260,135 @@ class MockSource {
   }
 }
 
+/* ============================================================
+   SuperheroSource — real Trendminer data (Phase 1)
+   Probed 2026-07-06, all CORS-open (Access-Control-Allow-Origin: *):
+     REST  https://api.superhero.com/api/tokens (trending list, price)
+     REST  https://api.superhero.com/api/transactions (buy/sell history)
+     WS    https://api.superhero.com (Socket.IO — token-transaction events)
+   No backend proxy needed. See CLAUDE.md Status log.
+   ============================================================ */
+const SUPERHERO_API = "https://api.superhero.com";
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
+function wordFromToken(t) {
+  return (t.symbol || t.name || t.sale_address || "").toUpperCase().replace(/[^A-Z0-9-]/g, "");
+}
+
+class SuperheroSource {
+  constructor(nodeCount) {
+    this.nodeCount = nodeCount;
+    this.bySaleAddr = new Map(); // sale_address -> word, for WS event -> node lookup
+  }
+
+  async getSnapshot() {
+    // API hard-caps limit at 100; the real token universe (~51 today) fits
+    // in one page comfortably, so no pagination is needed
+    const limit = Math.min(this.nodeCount, 100);
+    const res = await withTimeout(
+      fetch(`${SUPERHERO_API}/api/tokens?order_by=trending_score&order_direction=DESC&limit=${limit}&page=1`),
+      8000, "getSnapshot"
+    );
+    if (!res.ok) throw new Error(`tokens fetch failed: ${res.status}`);
+    const body = await res.json();
+    const tokens = (body.items || []).map((t) => {
+      const word = wordFromToken(t);
+      this.bySaleAddr.set(t.sale_address, word);
+      // bonding-curve prices are fractions of an AE cent — too flat to size
+      // nodes by visually, so market cap (price * supply, real and
+      // live-updating) drives size; trending_score drives brightness since
+      // there's no direct 24h-volume field on this endpoint
+      const decimals = Number(t.decimals) || 18;
+      const marketCap = (parseFloat(t.market_cap) || 0) / 10 ** decimals;
+      return {
+        word,
+        price: parseFloat(t.price_data?.ae ?? t.price) || 0,
+        volume24h: Math.max(0, parseFloat(t.trending_score) || 0) * 1e5,
+        marketCap,
+        holders: t.holders_count,
+        saleAddress: t.sale_address,
+      };
+    });
+    return { tokens };
+  }
+
+  subscribe(cb) {
+    let alive = true;
+    const socket = io(SUPERHERO_API, { transports: ["websocket", "polling"] });
+    this.socket = socket; // exposed for verification only
+    socket.on("connect", () => console.info("[WordMesh] live WS connected:", socket.id));
+    socket.on("token-transaction", (payload) => {
+      if (!alive) return;
+      if (payload.tx_type !== "buy" && payload.tx_type !== "sell") return;
+      const saleAddr = payload.sale_address || payload.token?.sale_address;
+      const word = this.bySaleAddr.get(saleAddr) || (payload.token ? wordFromToken(payload.token) : null);
+      if (!word) return;
+      cb({
+        type: payload.tx_type,
+        word,
+        amount: parseFloat(payload.amount?.ae ?? payload.amount) || 1,
+        ts: Date.now(),
+      });
+    });
+    socket.on("connect_error", (err) => console.warn("[WordMesh] live WS connect error:", err.message));
+    return () => { alive = false; socket.disconnect(); };
+  }
+
+  async getReplay(days = 7) {
+    const events = [];
+    const cutoff = Date.now() - days * 86400000;
+    for (let page = 1; page <= 6; page++) {
+      const res = await withTimeout(
+        fetch(`${SUPERHERO_API}/api/transactions?includes=token&limit=100&page=${page}`),
+        8000, "getReplay"
+      );
+      if (!res.ok) break;
+      const body = await res.json();
+      const items = body.items || [];
+      if (items.length === 0) break;
+      let pastCutoff = false;
+      for (const tx of items) {
+        if (tx.tx_type !== "buy" && tx.tx_type !== "sell") continue;
+        const ts = new Date(tx.created_at).getTime();
+        if (ts < cutoff) { pastCutoff = true; continue; }
+        events.push({
+          type: tx.tx_type,
+          word: wordFromToken(tx.token || {}),
+          amount: parseFloat(tx.amount?.ae ?? tx.amount) || 1,
+          ts,
+        });
+      }
+      if (pastCutoff) break;
+    }
+    return events.sort((a, b) => a.ts - b.ts);
+  }
+}
+
 const params = new URLSearchParams(location.search);
 const dataMode = params.get("data") === "live" ? "live" : "mock";
+let source = new MockSource(FULL_VOCAB.slice(0, NODE_COUNT));
+let liveSnapshot = null;
 if (dataMode === "live") {
-  console.warn("[WordMesh] ?data=live requested but SuperheroSource is not implemented in Phase 0 — falling back to MockSource. See CLAUDE.md Phase 1.");
+  try {
+    const liveSource = new SuperheroSource(NODE_COUNT);
+    liveSnapshot = await liveSource.getSnapshot();
+    if (!liveSnapshot.tokens.length) throw new Error("empty token list");
+    source = liveSource;
+    document.getElementById("mock-badge").textContent = "LIVE DATA";
+    document.getElementById("mock-badge").classList.add("live");
+  } catch (err) {
+    console.warn("[WordMesh] live data unavailable, falling back to MockSource:", err.message);
+    document.getElementById("mock-badge").textContent = "MOCK DATA (live unavailable)";
+  }
+} else {
+  document.getElementById("mock-badge").textContent = "MOCK DATA";
 }
-const source = new MockSource(FULL_VOCAB.slice(0, NODE_COUNT));
-document.getElementById("mock-badge").textContent = "MOCK DATA";
 
 /* ============================================================
    Renderer / scene / camera rig
@@ -357,7 +481,9 @@ buildStarfield();
    Word-node mesh (InstancedMesh, one draw call — perf budget)
    ============================================================ */
 
-const words = FULL_VOCAB.slice(0, NODE_COUNT);
+const words = (dataMode === "live" && liveSnapshot)
+  ? liveSnapshot.tokens.map((t) => t.word).slice(0, NODE_COUNT)
+  : FULL_VOCAB.slice(0, NODE_COUNT);
 const nodeGeo = new THREE.IcosahedronGeometry(1, 1);
 const nodeMat = new THREE.MeshStandardMaterial({
   color: 0x224466, emissive: 0x2255ff, emissiveIntensity: 1.4,
@@ -394,9 +520,29 @@ function hueForWord(i) {
   return (i * 0.618033) % 1;
 }
 
+// live-mode real market caps/volumes span many orders of magnitude (143 to
+// 1.6M+ AE observed) and saturate the mock-tuned log formulas above, which
+// were tuned for MockSource's 0.002-4 price range — every real node would
+// render at the same maxed-out size. Instead, normalize log-scale within
+// the current snapshot's actual min/max so size and brightness spread
+// across the full visual range regardless of the real values' absolute
+// scale. reviveSlot() reuses the same stored range for consistency.
+let liveSizeRange = null, liveVolRange = null;
+function liveNormScale(v, range, lo, hi) {
+  if (!range || range.max <= range.min) return (lo + hi) / 2;
+  const t = (Math.log10(1 + Math.max(0, v)) - range.min) / (range.max - range.min);
+  return lo + Math.max(0, Math.min(1, t)) * (hi - lo);
+}
+
 async function initNodes() {
-  const snap = await source.getSnapshot();
+  const snap = liveSnapshot || await source.getSnapshot();
   const byWord = new Map(snap.tokens.map((t) => [t.word, t]));
+  if (dataMode === "live") {
+    const mcLogs = snap.tokens.map((t) => Math.log10(1 + Math.max(0, t.marketCap || 0)));
+    const volLogs = snap.tokens.map((t) => Math.log10(1 + Math.max(0, t.volume24h || 0)));
+    liveSizeRange = { min: Math.min(...mcLogs), max: Math.max(...mcLogs) };
+    liveVolRange = { min: Math.min(...volLogs), max: Math.max(...volLogs) };
+  }
   for (let i = 0; i < words.length; i++) {
     const word = words[i];
     const tok = byWord.get(word);
@@ -410,16 +556,30 @@ async function initNodes() {
     );
     const hue = hueForWord(i);
     const baseColor = new THREE.Color().setHSL(hue, 0.75, 0.55);
+    const sizeMetric = tok.marketCap != null ? tok.marketCap : tok.price;
+    const scale = dataMode === "live"
+      ? liveNormScale(sizeMetric, liveSizeRange, 0.35, 1.95)
+      : priceToScale(sizeMetric);
+    const intensity = dataMode === "live"
+      ? liveNormScale(tok.volume24h, liveVolRange, 0.6, 3.0)
+      : volumeToIntensity(tok.volume24h);
     const entry = {
       word, index: i, alive: true,
-      price: tok.price, volume24h: tok.volume24h,
+      price: tok.price, volume24h: tok.volume24h, marketCap: tok.marketCap,
       pos, baseColor,
-      scale: priceToScale(tok.price),
-      intensity: volumeToIntensity(tok.volume24h),
+      scale, intensity,
       flare: 0, // decays each frame, added to intensity/scale on events
       dying: false, dieT: 0, spawnT: 1,
     };
     nodeData.push(entry);
+  }
+  // unused instance slots (live mode may have fewer real tokens than
+  // NODE_COUNT) — hide them, refreshInstances() only iterates nodeData
+  for (let i = words.length; i < NODE_COUNT; i++) {
+    tmpObj.position.set(0, -9999, 0);
+    tmpObj.scale.setScalar(0.0001);
+    tmpObj.updateMatrix();
+    nodeMesh.setMatrixAt(i, tmpObj.matrix);
   }
   refreshInstances();
   buildEdges();
@@ -553,6 +713,45 @@ function onDataEvent(evt) {
 }
 source.subscribe(onDataEvent);
 
+/* ---- Replay layer (CLAUDE.md decision 6): compress the last ~7 days of
+   real trades into a short repeating loop so the room always breathes
+   under the live feed's tiny real-time volume. Dimmer/cooler pulses, no
+   node scale/flare beyond a faint nudge, no HUD update — kept visually
+   and functionally distinct from genuine live buy/sell events. ---- */
+function flareNodeReplay(word) {
+  const n = nodeData.find((d) => d.word === word && d.alive);
+  if (!n) return;
+  n.flare = Math.max(n.flare, 0.12);
+  const fromIdx = edgeTowardNode(n.index);
+  if (fromIdx === null) return;
+  const cool = n.baseColor.clone().lerp(new THREE.Color(0x3a6fb0), 0.6).multiplyScalar(0.55);
+  spawnPulse(fromIdx, n.index, cool, true);
+}
+
+const REPLAY_LOOP_MS = 90000; // ~7 real days compressed into 90s, looping
+async function startReplayLoop() {
+  if (dataMode !== "live") return;
+  let events;
+  try {
+    events = await source.getReplay(7);
+  } catch (err) {
+    console.warn("[WordMesh] replay fetch failed:", err.message);
+    return;
+  }
+  if (!events.length) return;
+  const first = events[0].ts, last = events[events.length - 1].ts;
+  const span = Math.max(1, last - first);
+  const schedule = () => {
+    for (const evt of events) {
+      const delay = ((evt.ts - first) / span) * REPLAY_LOOP_MS;
+      setTimeout(() => flareNodeReplay(evt.word), delay);
+    }
+  };
+  schedule();
+  setInterval(schedule, REPLAY_LOOP_MS);
+}
+startReplayLoop();
+
 let lastInfoNode = null, infoTimeout = null;
 function updateNodeInfo(n, type) {
   lastInfoNode = n;
@@ -574,15 +773,26 @@ function erlangBeat() {
 }
 
 function reviveSlot(n) {
-  const pool = spareWords.length ? spareWords : FULL_VOCAB;
-  const newWord = pool[(Math.random() * pool.length) | 0];
-  const idx = spareWords.indexOf(newWord);
-  if (idx >= 0) spareWords.splice(idx, 1);
-  n.word = newWord;
-  n.price = 0.002 + Math.random() * Math.random() * 4;
-  n.volume24h = Math.random() * Math.random() * 50000;
-  n.scale = priceToScale(n.price);
-  n.intensity = volumeToIntensity(n.volume24h);
+  if (dataMode === "live") {
+    // real token universe is small and fixed by symbol — respawn the same
+    // real word rather than inventing a replacement one
+  } else {
+    const pool = spareWords.length ? spareWords : FULL_VOCAB;
+    const newWord = pool[(Math.random() * pool.length) | 0];
+    const idx = spareWords.indexOf(newWord);
+    if (idx >= 0) spareWords.splice(idx, 1);
+    n.word = newWord;
+    n.price = 0.002 + Math.random() * Math.random() * 4;
+    n.volume24h = Math.random() * Math.random() * 50000;
+  }
+  const sizeMetric = n.marketCap != null ? n.marketCap : n.price;
+  if (dataMode === "live") {
+    n.scale = liveNormScale(sizeMetric, liveSizeRange, 0.35, 1.95);
+    n.intensity = liveNormScale(n.volume24h, liveVolRange, 0.6, 3.0);
+  } else {
+    n.scale = priceToScale(sizeMetric);
+    n.intensity = volumeToIntensity(n.volume24h);
+  }
   const r = 14 + Math.random() * 46;
   const theta = Math.random() * Math.PI * 2;
   const phi = Math.acos(2 * Math.random() - 1);
@@ -1166,7 +1376,7 @@ renderer.setAnimationLoop((time, frame) => {
 
 initNodes();
 setInterval(erlangBeat, ERLANG_INTERVAL);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent };
 </script>
 </body>
 </html>
