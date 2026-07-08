@@ -202,6 +202,9 @@ function buildVocabulary(count) {
 
 const FULL_VOCAB = buildVocabulary(320);
 const NODE_COUNT = 220;
+// Fix 2 (cosmetic label declutter): max labels shown at rest, by vol24h —
+// plus the hovered/selected node if it isn't already in that set.
+const LABEL_TOP_K = 20;
 
 function poissonDelay(meanMs) {
   return -Math.log(1 - Math.random()) * meanMs;
@@ -420,9 +423,15 @@ function applyFlatEyeHeight() {
 }
 applyFlatEyeHeight();
 
-const hemi = new THREE.HemisphereLight(0x8fb8ff, 0x0a0812, 0.55);
+// Fix 3: key + fill tuned so lit instanced spheres actually show a
+// light-side/dark-side gradient — a stronger key relative to the fill
+// (rather than a weak, near-shadowless rig) is what makes a sphere read as
+// a sphere instead of a flat emissive blob. Kept subtle against the black
+// background per threejs-visual-polish guidance — this is fill light, the
+// glow is still carried by emissive + bloom.
+const hemi = new THREE.HemisphereLight(0x8fb8ff, 0x0a0812, 0.32);
 scene.add(hemi);
-const dirLight = new THREE.DirectionalLight(0xbcd4ff, 0.35);
+const dirLight = new THREE.DirectionalLight(0xbcd4ff, 0.45);
 dirLight.position.set(10, 20, 10);
 scene.add(dirLight);
 
@@ -484,11 +493,72 @@ buildStarfield();
 const words = (dataMode === "live" && liveSnapshot)
   ? liveSnapshot.tokens.map((t) => t.word).slice(0, NODE_COUNT)
   : FULL_VOCAB.slice(0, NODE_COUNT);
-const nodeGeo = new THREE.IcosahedronGeometry(1, 1);
+// Fix 3: real lit spheres, not flat discs. SphereGeometry (vs. the old
+// low-poly icosahedron) gives a smooth normal across the surface so the
+// key/fill rig above produces a visible light-side/dark-side gradient.
+const nodeGeo = new THREE.SphereGeometry(1, 24, 16);
+// Per-instance emissive tint + luminance correction (Fix 3 "bloom
+// luminance"). Deliberately a SEPARATE attribute from instanceColor (which
+// drives the diffuse channel and already carries the existing flare/volume
+// brightness multiplier, uncapped up to 1.6x — see refreshInstances): baking
+// emissive from that same boosted value compounded with the per-hue scale
+// below and blew out every high-volume (typically larger) node to white.
+// This carries the node's PURE hue (not intensity-boosted) so the glow
+// stays controlled regardless of trade activity; blue reads darkest at
+// equal HSL sat/lightness and needs a lift so it doesn't disappear under
+// bloom, green/white/cream read brightest and get reined in — otherwise one
+// hue would visually dominate the whole mesh. Both written once at node
+// creation/revival (the values only depend on hue, constant for a node's
+// lifetime), not per frame.
+nodeGeo.setAttribute("instanceEmissiveColor", new THREE.InstancedBufferAttribute(new Float32Array(NODE_COUNT * 3).fill(1), 3));
+nodeGeo.setAttribute("instanceEmissiveScale", new THREE.InstancedBufferAttribute(new Float32Array(NODE_COUNT).fill(1), 1));
+function emissiveScaleForColor(color) {
+  const lum = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+  return THREE.MathUtils.clamp(0.35 / Math.max(0.12, lum), 0.4, 1.5);
+}
+function writeEmissiveAttributes(index, color) {
+  nodeGeo.attributes.instanceEmissiveColor.setXYZ(index, color.r, color.g, color.b);
+  nodeGeo.attributes.instanceEmissiveColor.needsUpdate = true;
+  nodeGeo.attributes.instanceEmissiveScale.array[index] = emissiveScaleForColor(color);
+  nodeGeo.attributes.instanceEmissiveScale.needsUpdate = true;
+}
 const nodeMat = new THREE.MeshStandardMaterial({
-  color: 0x224466, emissive: 0x2255ff, emissiveIntensity: 1.4,
-  roughness: 0.4, metalness: 0.1,
+  color: 0xd8d8d8, // instanceColor (hue + existing flare/volume boost) drives diffuse
+  emissive: 0xffffff, // instanceEmissiveColor (pure hue) + per-hue scale, patched in below
+  emissiveIntensity: 0.5,
+  roughness: 0.4, metalness: 0,
 });
+// Fresnel rim (Fix 3 "pop"): a real view-angle-dependent edge glow, added
+// straight into the shaded output, so sphere silhouettes read against the
+// black background instead of just the flat emissive halo bloom already
+// gives every node. Kept as a shader patch (not a second back-shell mesh)
+// so the node system stays a single InstancedMesh / one draw call.
+const NODE_FRESNEL_COLOR = new THREE.Color(0x9fd8ff);
+nodeMat.onBeforeCompile = (shader) => {
+  shader.uniforms.fresnelColor = { value: NODE_FRESNEL_COLOR };
+  shader.vertexShader = shader.vertexShader
+    .replace(
+      "#include <common>",
+      "#include <common>\nattribute float instanceEmissiveScale;\nattribute vec3 instanceEmissiveColor;\nvarying float vInstanceEmissiveScale;\nvarying vec3 vInstanceEmissiveColor;"
+    )
+    .replace(
+      "#include <begin_vertex>",
+      "#include <begin_vertex>\nvInstanceEmissiveScale = instanceEmissiveScale;\nvInstanceEmissiveColor = instanceEmissiveColor;"
+    );
+  shader.fragmentShader = shader.fragmentShader
+    .replace("#include <common>", "#include <common>\nvarying float vInstanceEmissiveScale;\nvarying vec3 vInstanceEmissiveColor;\nuniform vec3 fresnelColor;")
+    .replace(
+      "#include <emissivemap_fragment>",
+      `#include <emissivemap_fragment>
+       totalEmissiveRadiance *= vInstanceEmissiveScale * vInstanceEmissiveColor;`
+    )
+    .replace(
+      "#include <dithering_fragment>",
+      `float wmFresnel = pow(1.0 - clamp(dot(normalize(vNormal), normalize(vViewPosition)), 0.0, 1.0), 2.5);
+       gl_FragColor.rgb += wmFresnel * fresnelColor * 0.85;
+       #include <dithering_fragment>`
+    );
+};
 const nodeMesh = new THREE.InstancedMesh(nodeGeo, nodeMat, NODE_COUNT);
 nodeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 scene.add(nodeMesh);
@@ -496,7 +566,6 @@ scene.add(nodeMesh);
 // distant LOD: point-sprite stand-ins, swapped in per-frame by hiding the
 // corresponding instanced mesh instance (scale 0) beyond LOD_DIST
 const LOD_DIST = 55;
-const LABEL_DIST = 8;
 const farGeo = new THREE.BufferGeometry();
 const farPositions = new Float32Array(NODE_COUNT * 3);
 const farColors = new Float32Array(NODE_COUNT * 3);
@@ -572,6 +641,7 @@ async function initNodes() {
       dying: false, dieT: 0, spawnT: 1,
     };
     nodeData.push(entry);
+    writeEmissiveAttributes(i, baseColor);
   }
   // unused instance slots (live mode may have fewer real tokens than
   // NODE_COUNT) — hide them, refreshInstances() only iterates nodeData
@@ -753,10 +823,14 @@ async function startReplayLoop() {
 startReplayLoop();
 
 let lastInfoNode = null, infoTimeout = null;
+// type is optional: trade events pass 'buy'/'sell'; hover/select (Fix 1/2 —
+// this is the readout truncated labels resolve their full name through)
+// call it with no type for a plain name/price/volume readout.
 function updateNodeInfo(n, type) {
   lastInfoNode = n;
   const el = document.getElementById("node-info");
-  el.innerHTML = `<b>${n.word}</b><br/>${type.toUpperCase()} · price ${n.price.toFixed(4)} AE · vol24h ${Math.round(n.volume24h)}`;
+  const prefix = type ? `${type.toUpperCase()} · ` : "";
+  el.innerHTML = `<b>${n.word}</b><br/>${prefix}price ${n.price.toFixed(4)} AE · vol24h ${Math.round(n.volume24h)}`;
   el.classList.add("show");
   clearTimeout(infoTimeout);
   infoTimeout = setTimeout(() => el.classList.remove("show"), 2600);
@@ -798,6 +872,7 @@ function reviveSlot(n) {
   const phi = Math.acos(2 * Math.random() - 1);
   n.pos.set(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi) * 0.6, r * Math.sin(phi) * Math.sin(theta));
   n.baseColor = new THREE.Color().setHSL(Math.random(), 0.75, 0.55);
+  writeEmissiveAttributes(n.index, n.baseColor);
   n.alive = true; n.dying = false; n.spawnT = 0;
 }
 
@@ -900,6 +975,29 @@ window.addEventListener("pointermove", (e) => {
   yaw -= dx * 0.0035;
   pitch -= dy * 0.0035;
   pitch = Math.max(-1.4, Math.min(1.4, pitch));
+});
+
+// Fix 2 (cosmetic): hover/tap node picking, purely to resolve a truncated
+// label's full name in the existing #node-info readout and to give the
+// hovered/selected node's label top overlap priority. Separate listeners —
+// doesn't alter the drag/look handlers above.
+const raycaster = new THREE.Raycaster();
+const mouseNDC = new THREE.Vector2(-2, -2); // starts off-screen
+window.addEventListener("pointermove", (e) => {
+  if (dragging || pointerLocked) return;
+  mouseNDC.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouseNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
+});
+canvas.addEventListener("pointerdown", (e) => {
+  mouseNDC.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouseNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouseNDC, camera);
+  const hit = raycaster.intersectObject(nodeMesh)[0];
+  if (hit && hit.instanceId != null && nodeData[hit.instanceId] && nodeData[hit.instanceId].alive) {
+    selectedNodeIndex = hit.instanceId;
+    selectedUntil = performance.now() + 4000;
+    updateNodeInfo(nodeData[hit.instanceId]);
+  }
 });
 
 // free-look toggle: desktop -> pointer lock, mobile -> gyro
@@ -1019,70 +1117,89 @@ setTimeout(hideHint, 6000);
 canvas.addEventListener("pointerdown", hideHint, { once: true });
 
 /* ============================================================
-   Billboard labels
-   - top ~20 words by volume: persistent, always visible, scale/fade with range
-   - everything else: proximity-only, within ~8m (existing behavior)
-   Both pools are fixed-size and pooled — no per-frame allocations.
+   Billboard labels (cosmetic pass: auto-fit, tethered, decluttered)
+   - one pooled sprite set, size LABEL_TOP_K + 1: top-K by vol24h, plus the
+     hovered/selected node if it isn't already in that set (highest overlap
+     priority — index 0 of `chosen`).
+   - each label's canvas is sized exactly to its measured text (Fix 1: the
+     pill can never be narrower than the text it holds); long tickers are
+     capped and shown with a real ellipsis, full name lives in the existing
+     #node-info readout on hover/select.
+   - screen-space overlap is resolved every frame in priority order (higher
+     vol24h / hover / select wins); a thin tether line + colour-matched dot
+     + colour-tinted underline visually ties each label to its node.
+   Sprite is always camera-facing (THREE.Sprite billboards by default).
    ============================================================ */
-const LABEL_POOL_SIZE = 14;
+const LABEL_DPR = Math.min(window.devicePixelRatio || 1, 2);
+const LABEL_FONT_PX = 34 * LABEL_DPR;
+const LABEL_PAD_X = 22 * LABEL_DPR, LABEL_PAD_Y = 14 * LABEL_DPR;
+const LABEL_DOT_R = 7 * LABEL_DPR, LABEL_DOT_GAP = 12 * LABEL_DPR;
+const LABEL_WORLD_HEIGHT = 0.6; // fixed world-space height; width follows text via canvas aspect
+const LABEL_MAX_CHARS = 12;
+const LABEL_TRUNCATE_CHARS = 9; // "LITCHSUPERHERO" (14) -> "LITCHSUPE…"
+
+function displayWord(word) {
+  return word.length > LABEL_MAX_CHARS ? word.slice(0, LABEL_TRUNCATE_CHARS) + "…" : word;
+}
+
 const labelPool = [];
-function makeLabelSprite(canvasW, canvasH, baseScaleX, baseScaleY) {
+function makeLabelSprite() {
   const cnv = document.createElement("canvas");
-  cnv.width = canvasW; cnv.height = canvasH;
+  cnv.width = 4; cnv.height = 4; // real size set per-paint, once text is measured
   const tex = new THREE.CanvasTexture(cnv);
   tex.colorSpace = THREE.SRGBColorSpace;
   const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
   const sprite = new THREE.Sprite(mat);
-  sprite.scale.set(baseScaleX, baseScaleY, 1);
   sprite.visible = false;
   scene.add(sprite);
-  return { sprite, cnv, tex, lastWord: null, baseScaleX, baseScaleY };
+  return { sprite, cnv, tex, lastWord: null, lastHex: null, nodeIndex: -1, baseW: 1, baseH: 1, textW: 0, dotSpace: 0 };
 }
-for (let i = 0; i < LABEL_POOL_SIZE; i++) labelPool.push(makeLabelSprite(256, 64, 2.6, 0.65));
+for (let i = 0; i < LABEL_TOP_K + 1; i++) labelPool.push(makeLabelSprite());
 
-function paintLabel(entry, text) {
+// Fix 1: canvas is sized exactly to the measured text (+ padding + dot),
+// at devicePixelRatio, so the pill can never clip — then the sprite is
+// scaled by the canvas's own aspect ratio, at a fixed world-space height.
+// Fix 2: colour-matched dot + a colour-tinted underline strip tie the
+// label to its node visually.
+function paintLabelAutoFit(entry, word, hexColor) {
+  const text = displayWord(word);
+  const measureCtx = entry.cnv.getContext("2d");
+  measureCtx.font = `700 ${LABEL_FONT_PX}px -apple-system, sans-serif`;
+  const textW = measureCtx.measureText(text).width;
+  const dotSpace = LABEL_DOT_R * 2 + LABEL_DOT_GAP;
+  const w = Math.ceil(dotSpace + textW + LABEL_PAD_X * 2);
+  const h = Math.ceil(LABEL_FONT_PX * 1.15 + LABEL_PAD_Y * 2);
+  entry.cnv.width = w;
+  entry.cnv.height = h; // resizing clears the canvas + resets context state
   const ctx = entry.cnv.getContext("2d");
-  ctx.clearRect(0, 0, entry.cnv.width, entry.cnv.height);
-  ctx.font = "bold 34px -apple-system, sans-serif";
-  ctx.fillStyle = "rgba(180,210,255,0.95)";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(text, entry.cnv.width/2, entry.cnv.height/2);
-  entry.tex.needsUpdate = true;
-  entry.lastWord = text;
-}
-
-/* ---- persistent top-word labels (main nodes, legible across the mesh) ---- */
-const TOP_LABEL_COUNT = 20;
-const TOP_LABEL_RECOMPUTE_MS = 2500;
-const topLabelPool = [];
-for (let i = 0; i < TOP_LABEL_COUNT; i++) topLabelPool.push(makeLabelSprite(320, 88, 4.4, 1.21));
-
-function paintTopLabel(entry, text, hexColor) {
-  const ctx = entry.cnv.getContext("2d");
-  const w = entry.cnv.width, h = entry.cnv.height;
   ctx.clearRect(0, 0, w, h);
-  ctx.font = "700 40px -apple-system, sans-serif";
-  const metrics = ctx.measureText(text);
-  const pillW = Math.min(w - 8, metrics.width + 64);
-  const pillX = (w - pillW) / 2;
-  ctx.fillStyle = "rgba(6,10,20,0.55)";
+  ctx.fillStyle = "rgba(6,10,20,0.6)";
   ctx.beginPath();
-  ctx.roundRect(pillX, 14, pillW, h - 28, (h - 28) / 2);
+  ctx.roundRect(0, 0, w, h, h / 2);
   ctx.fill();
-  // small dot tinting the pill to the node's own color, for quick visual grouping
   ctx.fillStyle = hexColor;
   ctx.beginPath();
-  ctx.arc(pillX + 22, h / 2, 8, 0, Math.PI * 2);
+  ctx.arc(LABEL_PAD_X * 0.5 + dotSpace / 2, h / 2, LABEL_DOT_R, 0, Math.PI * 2);
   ctx.fill();
+  ctx.font = `700 ${LABEL_FONT_PX}px -apple-system, sans-serif`;
   ctx.fillStyle = "#eaf6ff";
-  ctx.textAlign = "center";
+  ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   ctx.shadowColor = hexColor;
-  ctx.shadowBlur = 10;
-  ctx.fillText(text, w / 2 + 14, h / 2 + 1);
+  ctx.shadowBlur = 7 * LABEL_DPR;
+  const textX = LABEL_PAD_X * 0.5 + dotSpace;
+  ctx.fillText(text, textX, h / 2 - LABEL_DPR);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = hexColor;
+  ctx.globalAlpha = 0.85;
+  ctx.fillRect(textX, h - LABEL_PAD_Y * 0.7, textW, Math.max(2, 2 * LABEL_DPR));
+  ctx.globalAlpha = 1;
   entry.tex.needsUpdate = true;
-  entry.lastWord = text;
+  entry.lastWord = word;
+  entry.lastHex = hexColor;
+  const aspect = w / h;
+  entry.baseW = LABEL_WORLD_HEIGHT * aspect;
+  entry.baseH = LABEL_WORLD_HEIGHT;
 }
 
 function smoothstep01(edge0, edge1, x) {
@@ -1090,27 +1207,72 @@ function smoothstep01(edge0, edge1, x) {
   return t * t * (3 - 2 * t);
 }
 
-// recomputed periodically (not per frame) — sorts by volume24h and assigns
-// the highest-volume alive nodes to the persistent pool. n.isTopWord lets the
-// proximity system below skip nodes that already have a persistent label.
-let lastTopRecompute = -Infinity;
-function updateTopWords(time) {
-  if (time - lastTopRecompute < TOP_LABEL_RECOMPUTE_MS) return;
-  lastTopRecompute = time;
+// Fix 2 declutter: hovered/selected node (set by the raycast hit-testing
+// further down) always gets a label even if outside the top-K, and takes
+// top overlap priority.
+let hoveredNodeIndex = -1, selectedNodeIndex = -1, selectedUntil = 0;
+
+const LABEL_RECOMPUTE_MS = 350;
+let lastLabelRecompute = -Infinity;
+function updateVisibleLabels(time) {
+  if (time - lastLabelRecompute < LABEL_RECOMPUTE_MS) return;
+  lastLabelRecompute = time;
+  if (selectedNodeIndex >= 0 && time > selectedUntil) selectedNodeIndex = -1;
   for (const n of nodeData) n.isTopWord = false;
-  const ranked = nodeData
-    .filter((n) => n.alive)
-    .sort((a, b) => b.volume24h - a.volume24h)
-    .slice(0, TOP_LABEL_COUNT);
-  for (let i = 0; i < TOP_LABEL_COUNT; i++) {
-    const entry = topLabelPool[i];
-    const n = ranked[i];
+  const ranked = nodeData.filter((n) => n.alive).sort((a, b) => b.volume24h - a.volume24h);
+  const extraIdx = selectedNodeIndex >= 0 ? selectedNodeIndex : hoveredNodeIndex;
+  const extraNode = extraIdx >= 0 && nodeData[extraIdx] && nodeData[extraIdx].alive ? nodeData[extraIdx] : null;
+  const chosen = [];
+  if (extraNode) chosen.push(extraNode);
+  for (const n of ranked) {
+    if (chosen.length >= labelPool.length) break;
+    if (extraNode && n.index === extraNode.index) continue;
+    chosen.push(n);
+  }
+  for (const n of chosen) n.isTopWord = true;
+  for (let i = 0; i < labelPool.length; i++) {
+    const entry = labelPool[i];
+    const n = chosen[i];
     entry.nodeIndex = n ? n.index : -1;
-    if (n) n.isTopWord = true;
-    if (n && entry.lastWord !== n.word) {
-      paintTopLabel(entry, n.word, "#" + n.baseColor.getHexString());
+    if (n) {
+      const hex = "#" + n.baseColor.getHexString();
+      if (entry.lastWord !== n.word || entry.lastHex !== hex) paintLabelAutoFit(entry, n.word, hex);
     }
   }
+}
+
+/* ---- leader lines: node centre -> label anchor, node colour, low opacity ---- */
+const leaderGeo = new THREE.BufferGeometry();
+const leaderPositions = new Float32Array(labelPool.length * 2 * 3);
+const leaderColors = new Float32Array(labelPool.length * 2 * 3);
+leaderGeo.setAttribute("position", new THREE.BufferAttribute(leaderPositions, 3));
+leaderGeo.setAttribute("color", new THREE.BufferAttribute(leaderColors, 3));
+leaderGeo.setDrawRange(0, 0);
+const leaderMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.4, depthWrite: false });
+const leaderLines = new THREE.LineSegments(leaderGeo, leaderMat);
+scene.add(leaderLines);
+
+// scratch objects reused every frame — no per-frame allocations
+const _labelCenter = new THREE.Vector3();
+const _labelRight = new THREE.Vector3();
+const _labelUp = new THREE.Vector3();
+const _projA = new THREE.Vector3();
+const _projB = new THREE.Vector3();
+const _screenPos = labelPool.map(() => ({ x: 0, y: 0, halfW: 0, halfH: 0 }));
+const _placedIdx = new Int32Array(labelPool.length); // scratch: indices placed so far this frame
+
+// perspective-correct screen-space half-extent (in pixels) of a world-space
+// offset from _labelCenter along a (normalized) axis — projects centre and
+// an offset point and measures the pixel delta. No per-call allocation.
+function screenHalfExtent(centerNDCx, centerNDCy, axisVec, halfLenWorld, screenW, screenH) {
+  _projA.copy(_labelCenter).addScaledVector(axisVec, halfLenWorld).project(camera);
+  const dx = (_projA.x - centerNDCx) * 0.5 * screenW;
+  const dy = (_projA.y - centerNDCy) * 0.5 * screenH;
+  return Math.hypot(dx, dy);
+}
+
+function boxesOverlap(a, b) {
+  return Math.abs(a.x - b.x) < (a.halfW + b.halfW) && Math.abs(a.y - b.y) < (a.halfH + b.halfH);
 }
 
 /* ============================================================
@@ -1134,7 +1296,7 @@ if (window.visualViewport) window.visualViewport.addEventListener("resize", resi
    ============================================================ */
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.55, 0.4, 0.82);
+const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.4, 0.4, 0.9);
 bloom.resolution = new THREE.Vector2(window.innerWidth/2, window.innerHeight/2);
 composer.addPass(bloom);
 composer.addPass(new OutputPass());
@@ -1174,7 +1336,7 @@ const _targetVel = new THREE.Vector3(); // scratch, reused every frame
 const _labelOffset = new THREE.Vector3(); // scratch, reused every frame
 const clock = new THREE.Clock();
 let edgeRebuildAccum = 0;
-let lastLabelSweep = 0;
+let lastHoverCheck = 0;
 
 // Tuned for "glide through a constellation": fast enough to cross the ~120-unit
 // field in well under a minute, smoothed so input reads as momentum rather than
@@ -1325,45 +1487,77 @@ renderer.setAnimationLoop((time, frame) => {
   pulseMesh.instanceMatrix.needsUpdate = true;
   if (pulseMesh.instanceColor) pulseMesh.instanceColor.needsUpdate = true;
 
-  // persistent labels for the top-volume words — recomputed periodically,
-  // but repositioned/rescaled every frame so they track the camera smoothly
-  updateTopWords(time);
-  for (let i = 0; i < TOP_LABEL_COUNT; i++) {
-    const entry = topLabelPool[i];
+  // throttled hover raycast — desktop-only (mouseNDC stays off-screen on
+  // touch), cheap against ~200 instances but no need to run every frame
+  if (time - lastHoverCheck > 90) {
+    lastHoverCheck = time;
+    raycaster.setFromCamera(mouseNDC, camera);
+    const hit = raycaster.intersectObject(nodeMesh)[0];
+    const idx = (hit && hit.instanceId != null && nodeData[hit.instanceId] && nodeData[hit.instanceId].alive) ? hit.instanceId : -1;
+    if (idx !== hoveredNodeIndex) {
+      hoveredNodeIndex = idx;
+      if (idx >= 0) updateNodeInfo(nodeData[idx]);
+    }
+  }
+
+  // Fix 1/2: labels — top-K + hover/select pool (recomputed periodically),
+  // repositioned/rescaled/faded every frame, screen-space overlap resolved
+  // in priority order, tethered to their node with a leader line.
+  updateVisibleLabels(time);
+  const screenW = canvas.clientWidth || window.innerWidth;
+  const screenH = canvas.clientHeight || window.innerHeight;
+  _labelRight.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+  _labelUp.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+  let placedCount = 0;
+  let leaderVerts = 0;
+  for (let i = 0; i < labelPool.length; i++) {
+    const entry = labelPool[i];
     const n = entry.nodeIndex >= 0 ? nodeData[entry.nodeIndex] : null;
     if (!n || !n.alive) { entry.sprite.visible = false; continue; }
     const dist = camPos.distanceTo(n.pos);
     // scale up with distance (counteracts perspective shrink) so it stays
     // legible from across the mesh, clamped so it doesn't balloon or vanish
-    const distMul = Math.min(2.6, Math.max(0.7, dist / 18));
-    const opacity = smoothstep01(2, 6, dist) * (1 - smoothstep01(85, 120, dist));
-    if (opacity <= 0.01) { entry.sprite.visible = false; continue; }
-    entry.sprite.visible = true;
-    entry.sprite.material.opacity = opacity;
-    entry.sprite.scale.set(entry.baseScaleX * distMul, entry.baseScaleY * distMul, 1);
-    _labelOffset.set(0, 1.3 * n.scale + 0.55, 0);
-    entry.sprite.position.copy(n.pos).add(_labelOffset);
-  }
+    const distMul = Math.min(2.2, Math.max(0.85, dist / 24));
+    const distOpacity = smoothstep01(2, 6, dist) * (1 - smoothstep01(85, 120, dist));
+    if (distOpacity <= 0.01) { entry.sprite.visible = false; continue; }
 
-  // pooled billboard labels within ~8m, for everything that isn't already
-  // a persistent top-word label
-  if (time - lastLabelSweep > 200) {
-    lastLabelSweep = time;
-    const near = nodeData
-      .filter((n) => n.alive && !n.isTopWord && camPos.distanceTo(n.pos) < LABEL_DIST)
-      .sort((a, b) => camPos.distanceTo(a.pos) - camPos.distanceTo(b.pos))
-      .slice(0, LABEL_POOL_SIZE);
-    for (let i = 0; i < LABEL_POOL_SIZE; i++) {
-      const entry = labelPool[i];
-      const n = near[i];
-      if (!n) { entry.sprite.visible = false; continue; }
-      entry.sprite.visible = true;
-      entry.sprite.material.opacity = 1;
-      _labelOffset.set(0, 1.1 * n.scale + 0.4, 0);
-      entry.sprite.position.copy(n.pos).add(_labelOffset);
-      if (entry.lastWord !== n.word) paintLabel(entry, n.word);
+    _labelOffset.set(0, 1.25 * n.scale + 0.5, 0);
+    _labelCenter.copy(n.pos).add(_labelOffset);
+    _projB.copy(_labelCenter).project(camera);
+    if (_projB.z > 1) { entry.sprite.visible = false; continue; } // behind camera
+
+    const box = _screenPos[i];
+    box.x = (_projB.x * 0.5 + 0.5) * screenW;
+    box.y = (1 - (_projB.y * 0.5 + 0.5)) * screenH;
+    box.halfW = screenHalfExtent(_projB.x, _projB.y, _labelRight, entry.baseW * distMul * 0.5, screenW, screenH);
+    box.halfH = screenHalfExtent(_projB.x, _projB.y, _labelUp, entry.baseH * distMul * 0.5, screenW, screenH);
+
+    // overlap resolution: labelPool is already priority-ordered (hover/select
+    // first, then descending vol24h) — hide this one if it collides with a
+    // higher-priority label already placed this frame; it reappears on its
+    // own once the camera moves enough to clear the overlap
+    let hidden = false;
+    for (let j = 0; j < placedCount; j++) {
+      if (boxesOverlap(box, _screenPos[_placedIdx[j]])) { hidden = true; break; }
     }
+    if (hidden) { entry.sprite.visible = false; continue; }
+    _placedIdx[placedCount++] = i;
+
+    entry.sprite.visible = true;
+    entry.sprite.material.opacity = distOpacity;
+    entry.sprite.scale.set(entry.baseW * distMul, entry.baseH * distMul, 1);
+    entry.sprite.position.copy(_labelCenter);
+
+    // leader line: node centre -> label anchor, node colour, low opacity
+    leaderPositions[leaderVerts*6+0] = n.pos.x; leaderPositions[leaderVerts*6+1] = n.pos.y; leaderPositions[leaderVerts*6+2] = n.pos.z;
+    leaderPositions[leaderVerts*6+3] = _labelCenter.x; leaderPositions[leaderVerts*6+4] = _labelCenter.y; leaderPositions[leaderVerts*6+5] = _labelCenter.z;
+    leaderColors[leaderVerts*6+0] = n.baseColor.r; leaderColors[leaderVerts*6+1] = n.baseColor.g; leaderColors[leaderVerts*6+2] = n.baseColor.b;
+    leaderColors[leaderVerts*6+3] = n.baseColor.r; leaderColors[leaderVerts*6+4] = n.baseColor.g; leaderColors[leaderVerts*6+5] = n.baseColor.b;
+    leaderVerts++;
   }
+  leaderGeo.setDrawRange(0, leaderVerts * 2);
+  leaderGeo.attributes.position.needsUpdate = true;
+  leaderGeo.attributes.color.needsUpdate = true;
 
   edgeRebuildAccum += dt;
 
@@ -1376,7 +1570,7 @@ renderer.setAnimationLoop((time, frame) => {
 
 initNodes();
 setInterval(erlangBeat, ERLANG_INTERVAL);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; } };
 </script>
 </body>
 </html>
