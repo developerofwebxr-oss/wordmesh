@@ -35,6 +35,8 @@
     border: 1px solid rgba(255, 176, 32, 0.45);
   }
   #mock-badge.live { background: rgba(50, 220, 140, 0.18); color: #32dc8c; border-color: rgba(50, 220, 140, 0.45); }
+  #mock-badge.connecting { background: rgba(140, 170, 255, 0.18); color: #9db6ff; border-color: rgba(140, 170, 255, 0.45); }
+  #mock-badge.offline { background: rgba(255, 90, 90, 0.18); color: #ff6b6b; border-color: rgba(255, 90, 90, 0.45); }
 
   #mode-switcher {
     top: 14px; right: 16px; display: flex; gap: 6px; pointer-events: auto;
@@ -400,24 +402,26 @@ class SuperheroSource {
   }
 }
 
+// Live is the default experience — no query param needed. Mock only
+// exists as a hidden ?data=mock dev fallback (never the default, never
+// surfaced in any UI control). Nothing here blocks on a network fetch —
+// source/words are just declared; the actual connection (with retry and
+// honest connecting/live/offline badge states) happens in
+// connectDataSource(), called after the scene is fully set up, so the
+// renderer/starfield/HUD render immediately regardless of connection state.
 const params = new URLSearchParams(location.search);
-const dataMode = params.get("data") === "live" ? "live" : "mock";
-let source = new MockSource(FULL_VOCAB.slice(0, NODE_COUNT));
-let liveSnapshot = null;
-if (dataMode === "live") {
-  try {
-    const liveSource = new SuperheroSource(NODE_COUNT);
-    liveSnapshot = await liveSource.getSnapshot();
-    if (!liveSnapshot.tokens.length) throw new Error("empty token list");
-    source = liveSource;
-    document.getElementById("mock-badge").textContent = "LIVE DATA";
-    document.getElementById("mock-badge").classList.add("live");
-  } catch (err) {
-    console.warn("[WordMesh] live data unavailable, falling back to MockSource:", err.message);
-    document.getElementById("mock-badge").textContent = "MOCK DATA (live unavailable)";
-  }
+const dataMode = params.get("data") === "mock" ? "mock" : "live";
+const badgeEl = document.getElementById("mock-badge");
+let source;
+let words = [];
+if (dataMode === "mock") {
+  words = FULL_VOCAB.slice(0, NODE_COUNT);
+  source = new MockSource(words);
+  badgeEl.textContent = "MOCK DATA";
 } else {
-  document.getElementById("mock-badge").textContent = "MOCK DATA";
+  source = new SuperheroSource(NODE_COUNT);
+  badgeEl.textContent = "CONNECTING…";
+  badgeEl.classList.add("connecting");
 }
 
 /* ============================================================
@@ -521,9 +525,6 @@ buildStarfield();
    Word-node mesh (InstancedMesh, one draw call — perf budget)
    ============================================================ */
 
-const words = (dataMode === "live" && liveSnapshot)
-  ? liveSnapshot.tokens.map((t) => t.word).slice(0, NODE_COUNT)
-  : FULL_VOCAB.slice(0, NODE_COUNT);
 // Fix 3: real lit spheres, not flat discs. SphereGeometry (vs. the old
 // low-poly icosahedron) gives a smooth normal across the surface so the
 // key/fill rig above produces a visible light-side/dark-side gradient.
@@ -593,6 +594,18 @@ nodeMat.onBeforeCompile = (shader) => {
 const nodeMesh = new THREE.InstancedMesh(nodeGeo, nodeMat, NODE_COUNT);
 nodeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 scene.add(nodeMesh);
+// hide every instance up front — a freshly-created InstancedMesh defaults
+// every unset instance matrix to identity (visible, at the origin), which
+// would show a phantom cluster of unit spheres during the "connecting"
+// window before the first snapshot populates any real nodes
+{
+  const _setupTmp = new THREE.Object3D();
+  _setupTmp.position.set(0, -9999, 0);
+  _setupTmp.scale.setScalar(0.0001);
+  _setupTmp.updateMatrix();
+  for (let i = 0; i < NODE_COUNT; i++) nodeMesh.setMatrixAt(i, _setupTmp.matrix);
+  nodeMesh.instanceMatrix.needsUpdate = true;
+}
 
 // distant LOD: point-sprite stand-ins, swapped in per-frame by hiding the
 // corresponding instanced mesh instance (scale 0) beyond LOD_DIST
@@ -634,10 +647,15 @@ function liveNormScale(v, range, lo, hi) {
   return lo + Math.max(0, Math.min(1, t)) * (hi - lo);
 }
 
-async function initNodes() {
-  const snap = liveSnapshot || await source.getSnapshot();
+// Builds nodeData from a resolved snapshot. For live mode this ALSO
+// resolves `words` from the real token list (mock mode already has
+// `words` fixed up front). Called once by connectDataSource() below,
+// either immediately (mock) or after a successful live fetch (possibly
+// after several retries).
+function buildNodesFromSnapshot(snap) {
   const byWord = new Map(snap.tokens.map((t) => [t.word, t]));
   if (dataMode === "live") {
+    words = snap.tokens.map((t) => t.word).slice(0, NODE_COUNT);
     const mcLogs = snap.tokens.map((t) => Math.log10(1 + Math.max(0, t.marketCap || 0)));
     const volLogs = snap.tokens.map((t) => Math.log10(1 + Math.max(0, t.volume24h || 0)));
     liveSizeRange = { min: Math.min(...mcLogs), max: Math.max(...mcLogs) };
@@ -684,6 +702,38 @@ async function initNodes() {
   }
   refreshInstances();
   buildEdges();
+}
+
+// Mock is instant/synchronous (no real network) and effectively can't
+// fail, so it just builds once. Live retries with backoff and drives the
+// honest connecting/live/offline badge + in-scene chip states — it never
+// silently falls back to mock and never leaves the scene populated with
+// stale/fake data; on failure the mesh just stays empty (starfield still
+// visible, badge explains why) until a retry succeeds.
+const RECONNECT_DELAY_MS = 5000;
+const RECONNECT_DELAY_MAX_MS = 30000;
+async function connectDataSource() {
+  if (dataMode === "mock") {
+    buildNodesFromSnapshot(await source.getSnapshot());
+    return;
+  }
+  let attempt = 0;
+  for (;;) {
+    setConnectionState("connecting");
+    try {
+      const snap = await source.getSnapshot();
+      if (!snap.tokens.length) throw new Error("empty token list");
+      buildNodesFromSnapshot(snap);
+      setConnectionState("live");
+      return;
+    } catch (err) {
+      console.warn("[WordMesh] live snapshot failed, will retry:", err.message);
+      setConnectionState("offline");
+      const delay = Math.min(RECONNECT_DELAY_MAX_MS, RECONNECT_DELAY_MS * (attempt + 1));
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      attempt++;
+    }
+  }
 }
 
 function refreshInstances() {
@@ -1526,25 +1576,35 @@ function updatePanel(time) {
 }
 
 /* ============================================================
-   In-scene status chip — mirrors the MOCK DATA / LIVE DATA DOM badge.
+   In-scene status chip — mirrors the connection-state DOM badge
+   (MOCK DATA / CONNECTING… / LIVE DATA / OFFLINE — RETRYING…).
    Parented directly to the camera (not the rig) so it's rigidly stuck in
    the corner of view in every mode, including inside a headset where the
-   DOM badge is hidden. Painted once — data mode is fixed for a session.
-   Reuses the label system's auto-fit-canvas approach (measure text, size
-   the canvas exactly to it, no fixed-box clipping).
+   DOM badge is hidden. Repaintable — the connection state changes over a
+   session (connecting -> live, or -> offline and retrying), unlike the
+   old fixed mock-vs-live chip. Reuses the label system's auto-fit-canvas
+   approach (measure text, size the canvas exactly to it, no clipping).
    ============================================================ */
-function makeStatusChip() {
+const statusChipCanvas = document.createElement("canvas");
+const statusChipTex = new THREE.CanvasTexture(statusChipCanvas);
+statusChipTex.colorSpace = THREE.SRGBColorSpace;
+const statusChipMat = new THREE.SpriteMaterial({ map: statusChipTex, transparent: true, depthTest: false, depthWrite: false });
+const statusChip = new THREE.Sprite(statusChipMat);
+statusChip.renderOrder = 20;
+// sized/positioned conservatively so it stays fully in view even at a
+// narrow (mobile-portrait) aspect ratio, not just a wide desktop one
+statusChip.position.set(-0.05, -0.17, -0.5); // low, near-centre of view, always in frame
+camera.add(statusChip);
+
+function paintStatusChip(text, color) {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const text = dataMode === "live" ? "LIVE DATA" : "MOCK DATA";
-  const color = dataMode === "live" ? "#32dc8c" : "#ffb020";
-  const measure = document.createElement("canvas").getContext("2d");
-  measure.font = `700 ${20 * dpr}px -apple-system, sans-serif`;
-  const textW = measure.measureText(text).width;
+  const measureCtx = statusChipCanvas.getContext("2d");
+  measureCtx.font = `700 ${20 * dpr}px -apple-system, sans-serif`;
+  const textW = measureCtx.measureText(text).width;
   const padX = 14 * dpr, padY = 8 * dpr;
   const w = Math.ceil(textW + padX * 2), h = Math.ceil(20 * dpr + padY * 2);
-  const cnv = document.createElement("canvas");
-  cnv.width = w; cnv.height = h;
-  const ctx = cnv.getContext("2d");
+  statusChipCanvas.width = w; statusChipCanvas.height = h; // resizing clears + resets context state
+  const ctx = statusChipCanvas.getContext("2d");
   ctx.fillStyle = "rgba(6,10,20,0.75)";
   ctx.beginPath(); ctx.roundRect(0, 0, w, h, h / 2); ctx.fill();
   ctx.strokeStyle = color; ctx.lineWidth = 2 * dpr;
@@ -1553,20 +1613,29 @@ function makeStatusChip() {
   ctx.font = `700 ${20 * dpr}px -apple-system, sans-serif`;
   ctx.textAlign = "center"; ctx.textBaseline = "middle";
   ctx.fillText(text, w / 2, h / 2 + 1);
-  const tex = new THREE.CanvasTexture(cnv);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false });
-  const sprite = new THREE.Sprite(mat);
-  // sized/positioned conservatively so it stays fully in view even at a
-  // narrow (mobile-portrait) aspect ratio, not just a wide desktop one
+  statusChipTex.needsUpdate = true;
   const worldH = 0.03;
-  sprite.scale.set(worldH * (w / h), worldH, 1);
-  sprite.position.set(-0.05, -0.17, -0.5); // low, near-centre of view, always in frame
-  sprite.renderOrder = 20;
-  camera.add(sprite);
-  return sprite;
+  statusChip.scale.set(worldH * (w / h), worldH, 1);
 }
-const statusChip = makeStatusChip();
+
+// Single source of truth for connection-state text/colour, shared by the
+// DOM badge and the in-scene chip so they can never drift out of sync.
+const CONNECTION_STATES = {
+  mock: { text: "MOCK DATA", cls: "", color: "#ffb020" },
+  connecting: { text: "CONNECTING…", cls: "connecting", color: "#9db6ff" },
+  offline: { text: "OFFLINE — RETRYING…", cls: "offline", color: "#ff6b6b" },
+  live: { text: "LIVE DATA", cls: "live", color: "#32dc8c" },
+};
+function setConnectionState(state) {
+  const cfg = CONNECTION_STATES[state];
+  badgeEl.classList.remove("connecting", "offline", "live");
+  if (cfg.cls) badgeEl.classList.add(cfg.cls);
+  badgeEl.textContent = cfg.text;
+  paintStatusChip(cfg.text, cfg.color);
+}
+// sync the chip to whatever the DOM badge already shows from the
+// top-level dataMode setup (that ran before the chip existed)
+setConnectionState(dataMode === "mock" ? "mock" : "connecting");
 
 /* ============================================================
    Resize handling (visual viewport aware — mobile URL-bar safe)
@@ -1890,9 +1959,9 @@ renderer.setAnimationLoop((time, frame) => {
   }
 });
 
-initNodes();
+connectDataSource();
 setInterval(erlangBeat, ERLANG_INTERVAL);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; } };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; } };
 </script>
 </body>
 </html>
