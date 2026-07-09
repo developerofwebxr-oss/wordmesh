@@ -371,6 +371,33 @@ class SuperheroSource {
     }
     return events.sort((a, b) => a.ts - b.ts);
   }
+
+  // In-scene panel sparkline (live mode only): per-token hourly OHLC
+  // candles. Probed 2026-07-09 — generic query params on /api/transactions
+  // (sale_address=, token_address=) are silently ignored and just return
+  // the unfiltered global feed; this dedicated per-address endpoint is the
+  // real per-token source, confirmed against two different tokens (correct
+  // `symbol` echoed back in each response), CORS-open. Returns null on any
+  // failure/empty result so the panel can omit the sparkline gracefully —
+  // callers must never fabricate a series from this.
+  async getTokenHistory(saleAddress, hours = 48) {
+    try {
+      const res = await withTimeout(
+        fetch(`${SUPERHERO_API}/api/tokens/${saleAddress}/transactions?limit=${hours}`),
+        8000, "getTokenHistory"
+      );
+      if (!res.ok) return null;
+      const body = await res.json();
+      if (!Array.isArray(body) || body.length === 0) return null;
+      const points = body
+        .map((c) => ({ ts: new Date(c.quote?.timestamp || c.timeClose).getTime(), price: parseFloat(c.quote?.close) || 0 }))
+        .filter((p) => p.price > 0 && Number.isFinite(p.ts))
+        .sort((a, b) => a.ts - b.ts);
+      return points.length > 1 ? points : null;
+    } catch {
+      return null;
+    }
+  }
 }
 
 const params = new URLSearchParams(location.search);
@@ -638,7 +665,7 @@ async function initNodes() {
       : volumeToIntensity(tok.volume24h);
     const entry = {
       word, index: i, alive: true,
-      price: tok.price, volume24h: tok.volume24h, marketCap: tok.marketCap,
+      price: tok.price, volume24h: tok.volume24h, marketCap: tok.marketCap, saleAddress: tok.saleAddress,
       pos, baseColor,
       scale, intensity,
       flare: 0, // decays each frame, added to intensity/scale on events
@@ -1005,10 +1032,15 @@ window.addEventListener("pointermove", (e) => {
   pitch = Math.max(-1.4, Math.min(1.4, pitch));
 });
 
-// Fix 2 (cosmetic): hover/tap node picking, purely to resolve a truncated
-// label's full name in the existing #node-info readout and to give the
-// hovered/selected node's label top overlap priority. Separate listeners —
-// doesn't alter the drag/look handlers above.
+// Node selection — unified across every input modality. Mouse/tap set the
+// ray from screen coords + camera (this also covers handheld AR: Three.js's
+// XR manager keeps `camera` updated to the tracked device pose during a
+// session, so setFromCamera works unchanged there, no separate AR-tap code
+// needed). VR/AR controller trigger sets the ray directly from the
+// controller's own pose (see pollVRSelection, further down). Every input
+// funnels into the SAME raycaster + selectFromRay() — one selection path,
+// one piece of state (selectedNodeIndex), feeding both the existing
+// #node-info DOM readout and the in-scene detail panel.
 const raycaster = new THREE.Raycaster();
 const mouseNDC = new THREE.Vector2(-2, -2); // starts off-screen
 window.addEventListener("pointermove", (e) => {
@@ -1016,16 +1048,23 @@ window.addEventListener("pointermove", (e) => {
   mouseNDC.x = (e.clientX / window.innerWidth) * 2 - 1;
   mouseNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
 });
+function selectFromRay() {
+  const hit = raycaster.intersectObject(nodeMesh)[0];
+  if (hit && hit.instanceId != null && nodeData[hit.instanceId] && nodeData[hit.instanceId].alive) {
+    selectedNodeIndex = hit.instanceId;
+    updateNodeInfo(nodeData[hit.instanceId]);
+    openPanelFor(nodeData[hit.instanceId]);
+  } else if (selectedNodeIndex >= 0) {
+    // selecting empty space closes the panel and clears the highlight
+    selectedNodeIndex = -1;
+    closePanel();
+  }
+}
 canvas.addEventListener("pointerdown", (e) => {
   mouseNDC.x = (e.clientX / window.innerWidth) * 2 - 1;
   mouseNDC.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(mouseNDC, camera);
-  const hit = raycaster.intersectObject(nodeMesh)[0];
-  if (hit && hit.instanceId != null && nodeData[hit.instanceId] && nodeData[hit.instanceId].alive) {
-    selectedNodeIndex = hit.instanceId;
-    selectedUntil = performance.now() + 4000;
-    updateNodeInfo(nodeData[hit.instanceId]);
-  }
+  selectFromRay();
 });
 
 // free-look toggle: desktop -> pointer lock, mobile -> gyro
@@ -1248,15 +1287,16 @@ function smoothstep01(edge0, edge1, x) {
 
 // Fix 2 declutter: hovered/selected node (set by the raycast hit-testing
 // further down) always gets a label even if outside the top-K, and takes
-// top overlap priority.
-let hoveredNodeIndex = -1, selectedNodeIndex = -1, selectedUntil = 0;
+// top overlap priority. selectedNodeIndex is also the in-scene detail
+// panel's selection — sticky until explicitly closed (selecting empty
+// space, or the node dying), not a timed flash like the old 4s expiry.
+let hoveredNodeIndex = -1, selectedNodeIndex = -1;
 
 const LABEL_RECOMPUTE_MS = 350;
 let lastLabelRecompute = -Infinity;
 function updateVisibleLabels(time) {
   if (time - lastLabelRecompute < LABEL_RECOMPUTE_MS) return;
   lastLabelRecompute = time;
-  if (selectedNodeIndex >= 0 && time > selectedUntil) selectedNodeIndex = -1;
   for (const n of nodeData) n.isTopWord = false;
   const ranked = nodeData.filter((n) => n.alive).sort((a, b) => b.volume24h - a.volume24h);
   const extraIdx = selectedNodeIndex >= 0 ? selectedNodeIndex : hoveredNodeIndex;
@@ -1315,6 +1355,220 @@ function boxesOverlap(a, b) {
 }
 
 /* ============================================================
+   In-scene detail panel — world-space, works in Screen/VR/AR alike (the
+   DOM #node-info readout dies the instant an XR session starts — see
+   #hud.in-xr — so this is the detail view that survives immersion).
+   Docked ~1.35m in front of the head on open, then world-locked: its
+   POSITION doesn't chase the camera every frame (that would be nagging,
+   not "docked"), only its ROTATION billboards around the vertical (Y)
+   axis to keep facing the user as they move, per webxr-threejs billboard
+   guidance. Re-centers fresh each time a new node is opened. Fed by the
+   exact same selectedNodeIndex that drives #node-info — one selection
+   state, two presentations (DOM for quick Screen-mode hover, this panel
+   for the persistent everywhere-working detail view).
+   ============================================================ */
+const PANEL_DPR = Math.min(window.devicePixelRatio || 1, 2);
+const PANEL_W_PX = 480 * PANEL_DPR, PANEL_H_PX = 300 * PANEL_DPR;
+const PANEL_WORLD_WIDTH = 0.5; // metres — real-world scale for XR legibility
+const PANEL_WORLD_HEIGHT = PANEL_WORLD_WIDTH * (PANEL_H_PX / PANEL_W_PX);
+const PANEL_DOCK_DIST = 1.35;
+const PANEL_DOCK_DROP = 0.12; // slightly below eye level
+
+const panelCanvas = document.createElement("canvas");
+panelCanvas.width = PANEL_W_PX; panelCanvas.height = PANEL_H_PX;
+const panelTex = new THREE.CanvasTexture(panelCanvas);
+panelTex.colorSpace = THREE.SRGBColorSpace;
+const panelMat = new THREE.MeshBasicMaterial({ map: panelTex, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+const panelMesh = new THREE.Mesh(new THREE.PlaneGeometry(PANEL_WORLD_WIDTH, PANEL_WORLD_HEIGHT), panelMat);
+panelMesh.visible = false;
+panelMesh.renderOrder = 10; // draw after nodes/pulses so it reads clearly on top
+scene.add(panelMesh);
+
+// leader line: panel -> node, in the node's own colour (same tether
+// language as the label system), since the panel is docked away from it
+const panelLeaderGeo = new THREE.BufferGeometry();
+const panelLeaderPositions = new Float32Array(2 * 3);
+const panelLeaderColors = new Float32Array(2 * 3);
+panelLeaderGeo.setAttribute("position", new THREE.BufferAttribute(panelLeaderPositions, 3));
+panelLeaderGeo.setAttribute("color", new THREE.BufferAttribute(panelLeaderColors, 3));
+panelLeaderGeo.setDrawRange(0, 0);
+const panelLeaderMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.5, depthWrite: false });
+const panelLeaderLine = new THREE.LineSegments(panelLeaderGeo, panelLeaderMat);
+scene.add(panelLeaderLine);
+
+let panelNodeIndex = -1;
+let panelHistory = null;          // sparkline points, live mode only — null means omit, never fabricate
+let panelHistoryFetchedFor = null; // sale_address already requested, avoid refetching every repaint
+let lastPanelRepaint = -Infinity;
+const _headPosDock = new THREE.Vector3();
+const _fwdDock = new THREE.Vector3();
+const _lookTarget = new THREE.Vector3();
+
+function paintPanel(n) {
+  const ctx = panelCanvas.getContext("2d");
+  const w = panelCanvas.width, h = panelCanvas.height;
+  const dpr = PANEL_DPR;
+  ctx.clearRect(0, 0, w, h);
+  const hex = "#" + n.baseColor.getHexString();
+  ctx.fillStyle = "rgba(6,10,20,0.82)";
+  ctx.beginPath();
+  ctx.roundRect(0, 0, w, h, 18 * dpr);
+  ctx.fill();
+  ctx.strokeStyle = hex;
+  ctx.lineWidth = 3 * dpr;
+  ctx.beginPath();
+  ctx.roundRect(1.5 * dpr, 1.5 * dpr, w - 3 * dpr, h - 3 * dpr, 18 * dpr);
+  ctx.stroke();
+
+  const pad = 24 * dpr;
+  ctx.fillStyle = "#eaf6ff";
+  ctx.font = `700 ${34 * dpr}px -apple-system, sans-serif`;
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText(n.word, pad, pad);
+  ctx.fillStyle = hex;
+  ctx.beginPath();
+  ctx.arc(w - pad - 10 * dpr, pad + 17 * dpr, 10 * dpr, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.font = `500 ${22 * dpr}px -apple-system, sans-serif`;
+  ctx.fillStyle = "rgba(220,232,255,0.9)";
+  ctx.fillText(`price ${n.price.toFixed(4)} AE`, pad, pad + 56 * dpr);
+  ctx.fillText(`vol24h ${Math.round(n.volume24h)}`, pad, pad + 90 * dpr);
+
+  // sparkline — live mode only, real per-token candle history (probed
+  // 2026-07-09: /api/tokens/{address}/transactions is genuinely per-token).
+  // Omitted entirely (not drawn) when unavailable — never a fabricated line.
+  if (panelHistory && panelHistory.length > 1) {
+    const gx = pad, gy = pad + 140 * dpr, gw = w - pad * 2, gh = 90 * dpr;
+    const prices = panelHistory.map((p) => p.price);
+    const lo = Math.min(...prices), hi = Math.max(...prices);
+    const span = Math.max(1e-12, hi - lo);
+    ctx.strokeStyle = hex; ctx.lineWidth = 2.5 * dpr;
+    ctx.beginPath();
+    panelHistory.forEach((p, i) => {
+      const x = gx + (i / (panelHistory.length - 1)) * gw;
+      const y = gy + gh - ((p.price - lo) / span) * gh;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.font = `400 ${15 * dpr}px -apple-system, sans-serif`;
+    ctx.fillStyle = "rgba(160,180,220,0.7)";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText("48h", gx, gy + gh + 16 * dpr);
+  }
+  panelTex.needsUpdate = true;
+}
+
+function openPanelFor(n) {
+  const isNewNode = panelNodeIndex !== n.index;
+  panelNodeIndex = n.index;
+  panelMesh.visible = true;
+  paintPanel(n);
+  if (isNewNode) {
+    // re-dock in front of the head, world-locked from this point on
+    camera.getWorldPosition(_headPosDock);
+    camera.getWorldDirection(_fwdDock);
+    _fwdDock.y = 0;
+    if (_fwdDock.lengthSq() < 1e-6) _fwdDock.set(0, 0, -1); // edge case: looking straight up/down
+    _fwdDock.normalize();
+    panelMesh.position.copy(_headPosDock).addScaledVector(_fwdDock, PANEL_DOCK_DIST);
+    panelMesh.position.y -= PANEL_DOCK_DROP;
+
+    panelHistory = null;
+    if (dataMode === "live" && typeof source.getTokenHistory === "function" && n.saleAddress) {
+      if (panelHistoryFetchedFor !== n.saleAddress) {
+        panelHistoryFetchedFor = n.saleAddress;
+        source.getTokenHistory(n.saleAddress).then((points) => {
+          if (panelNodeIndex === n.index) { // selection hasn't moved on while this was in flight
+            panelHistory = points;
+            paintPanel(nodeData[n.index]);
+          }
+        }).catch(() => {});
+      }
+    }
+  }
+}
+
+function closePanel() {
+  panelNodeIndex = -1;
+  panelMesh.visible = false;
+  panelLeaderGeo.setDrawRange(0, 0);
+  panelHistory = null;
+  panelHistoryFetchedFor = null;
+}
+
+// per-frame: billboard (Y-axis only, so the panel never tilts), refresh
+// content periodically (price/vol tick live while open), update the
+// leader line, and auto-close if the selected node died (Erlang beat)
+function updatePanel(time) {
+  if (panelNodeIndex < 0) return;
+  const n = nodeData[panelNodeIndex];
+  if (!n || !n.alive) { closePanel(); selectedNodeIndex = -1; return; }
+
+  camera.getWorldPosition(_headPosDock);
+  _lookTarget.set(_headPosDock.x, panelMesh.position.y, _headPosDock.z);
+  if (_lookTarget.distanceToSquared(panelMesh.position) > 1e-8) {
+    panelMesh.lookAt(_lookTarget); // lookAt already faces the textured (+Z) side at the target
+  }
+
+  if (time - lastPanelRepaint > 400) {
+    lastPanelRepaint = time;
+    paintPanel(n);
+  }
+
+  panelLeaderPositions[0] = n.pos.x; panelLeaderPositions[1] = n.pos.y; panelLeaderPositions[2] = n.pos.z;
+  panelLeaderPositions[3] = panelMesh.position.x; panelLeaderPositions[4] = panelMesh.position.y; panelLeaderPositions[5] = panelMesh.position.z;
+  panelLeaderColors[0] = n.baseColor.r; panelLeaderColors[1] = n.baseColor.g; panelLeaderColors[2] = n.baseColor.b;
+  panelLeaderColors[3] = n.baseColor.r; panelLeaderColors[4] = n.baseColor.g; panelLeaderColors[5] = n.baseColor.b;
+  panelLeaderGeo.setDrawRange(0, 2);
+  panelLeaderGeo.attributes.position.needsUpdate = true;
+  panelLeaderGeo.attributes.color.needsUpdate = true;
+}
+
+/* ============================================================
+   In-scene status chip — mirrors the MOCK DATA / LIVE DATA DOM badge.
+   Parented directly to the camera (not the rig) so it's rigidly stuck in
+   the corner of view in every mode, including inside a headset where the
+   DOM badge is hidden. Painted once — data mode is fixed for a session.
+   Reuses the label system's auto-fit-canvas approach (measure text, size
+   the canvas exactly to it, no fixed-box clipping).
+   ============================================================ */
+function makeStatusChip() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const text = dataMode === "live" ? "LIVE DATA" : "MOCK DATA";
+  const color = dataMode === "live" ? "#32dc8c" : "#ffb020";
+  const measure = document.createElement("canvas").getContext("2d");
+  measure.font = `700 ${20 * dpr}px -apple-system, sans-serif`;
+  const textW = measure.measureText(text).width;
+  const padX = 14 * dpr, padY = 8 * dpr;
+  const w = Math.ceil(textW + padX * 2), h = Math.ceil(20 * dpr + padY * 2);
+  const cnv = document.createElement("canvas");
+  cnv.width = w; cnv.height = h;
+  const ctx = cnv.getContext("2d");
+  ctx.fillStyle = "rgba(6,10,20,0.75)";
+  ctx.beginPath(); ctx.roundRect(0, 0, w, h, h / 2); ctx.fill();
+  ctx.strokeStyle = color; ctx.lineWidth = 2 * dpr;
+  ctx.beginPath(); ctx.roundRect(1, 1, w - 2, h - 2, h / 2); ctx.stroke();
+  ctx.fillStyle = color;
+  ctx.font = `700 ${20 * dpr}px -apple-system, sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(text, w / 2, h / 2 + 1);
+  const tex = new THREE.CanvasTexture(cnv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false });
+  const sprite = new THREE.Sprite(mat);
+  // sized/positioned conservatively so it stays fully in view even at a
+  // narrow (mobile-portrait) aspect ratio, not just a wide desktop one
+  const worldH = 0.03;
+  sprite.scale.set(worldH * (w / h), worldH, 1);
+  sprite.position.set(-0.05, -0.17, -0.5); // low, near-centre of view, always in frame
+  sprite.renderOrder = 20;
+  camera.add(sprite);
+  return sprite;
+}
+const statusChip = makeStatusChip();
+
+/* ============================================================
    Resize handling (visual viewport aware — mobile URL-bar safe)
    ============================================================ */
 function resize() {
@@ -1343,12 +1597,23 @@ resize();
 
 /* ============================================================
    VR controller polling (best-effort — see status log)
+   + controller-laser select (trigger, buttons[0]) — bound the same on
+   both hands per the webxr-threejs standard, so no handedness check is
+   needed for selection. Controller ray objects are parented to `rig`
+   (matching `camera`'s own parenting) so their matrixWorld composes
+   correctly against nodeMesh, a direct child of `scene`. Feeds the SAME
+   raycaster + selectFromRay() as mouse/tap — one selection path.
    ============================================================ */
 let flyClickPrev = false;
 let snapCooldown = 0;
+const controllerRays = [renderer.xr.getController(0), renderer.xr.getController(1)];
+controllerRays.forEach((c) => rig.add(c));
+const triggerPrev = [false, false];
+const _ctrlDir = new THREE.Vector3();
 function pollVRControllers(session) {
   let moveX = 0, moveY = 0, turnX = 0;
-  for (const src of session.inputSources) {
+  for (let i = 0; i < session.inputSources.length; i++) {
+    const src = session.inputSources[i];
     if (!src.gamepad) continue;
     const gp = src.gamepad;
     if (src.handedness === "left") {
@@ -1360,6 +1625,15 @@ function pollVRControllers(session) {
       if (clicked && !flyClickPrev) btnFly.click();
       flyClickPrev = clicked;
     }
+    const triggerPressed = !!(gp.buttons[0] && gp.buttons[0].pressed);
+    if (triggerPressed && !triggerPrev[i] && i < controllerRays.length) {
+      const ctrl = controllerRays[i];
+      raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
+      _ctrlDir.set(0, 0, -1).transformDirection(ctrl.matrixWorld);
+      raycaster.ray.direction.copy(_ctrlDir);
+      selectFromRay();
+    }
+    triggerPrev[i] = triggerPressed;
   }
   return { moveX, moveY, turnX };
 }
@@ -1386,6 +1660,7 @@ const VR_MOVE_SPEED = 3.6;   // gentler in-headset per XR comfort norms
 const VR_SPRINT_SPEED = 7.5;
 const STICK_DEADZONE = 0.12;
 const VELOCITY_SMOOTH_TIME = 0.15; // seconds; lower = snappier, higher = floatier
+const SELECTED_FLARE_LEVEL = 0.5; // sustained node highlight while its panel is open
 
 renderer.setAnimationLoop((time, frame) => {
   const dt = Math.min(0.05, clock.getDelta());
@@ -1462,6 +1737,10 @@ renderer.setAnimationLoop((time, frame) => {
   // node flare decay + spawn/despawn animation
   for (const n of nodeData) {
     if (n.flare > 0) n.flare = Math.max(0, n.flare - dt * 1.6);
+    // panel selection highlight: brightness/shine only, via the existing
+    // flare mechanic (which only ever scales baseColor, never re-hues it)
+    // — never a colour change, per the task's explicit guardrail
+    if (n.index === selectedNodeIndex) n.flare = Math.max(n.flare, SELECTED_FLARE_LEVEL);
     if (n.dying) {
       n.dieT += dt;
       n.spawnT = Math.max(0, 1 - n.dieT / 1.5);
@@ -1539,6 +1818,10 @@ renderer.setAnimationLoop((time, frame) => {
     }
   }
 
+  // in-scene detail panel: billboard, periodic content refresh, leader
+  // line, auto-close if the open node died
+  updatePanel(time);
+
   // Fix 1/2: labels — top-K + hover/select pool (recomputed periodically),
   // repositioned/rescaled/faded every frame, screen-space overlap resolved
   // in priority order, tethered to their node with a leader line.
@@ -1609,7 +1892,7 @@ renderer.setAnimationLoop((time, frame) => {
 
 initNodes();
 setInterval(erlangBeat, ERLANG_INTERVAL);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; } };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; } };
 </script>
 </body>
 </html>
