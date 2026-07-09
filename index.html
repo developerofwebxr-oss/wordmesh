@@ -404,6 +404,10 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.xr.enabled = true;
+// room-scale floor-relative tracking (webxr-threejs standard) — without this
+// Three.js defaults to a 'local' reference space, whose origin can be an
+// arbitrary head-height point at session start rather than the real floor.
+renderer.xr.setReferenceSpaceType("local-floor");
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x030509);
@@ -903,6 +907,17 @@ async function enterXR(mode) {
       domOverlay: mode === "immersive-ar" ? { root: document.body } : undefined,
     });
     currentSession = session;
+    // Reset the shared rig to the reference-space origin before presenting.
+    // The mesh is already built centered at world (0,0,0) (initNodes spawns
+    // every node in a sphere around the origin) — so this is what actually
+    // puts the viewer inside it. rig.position accumulates freely while
+    // flying in Screen mode, and since the SAME rig is reused across every
+    // mode, entering AR without this reset dropped the viewer wherever
+    // Screen-mode flight last left off — beside or outside the mesh
+    // instead of embedded in it (reported as "the mesh sits off to the
+    // left"). Applies to VR too, for the same reason.
+    rig.position.set(0, 0, 0);
+    rig.rotation.set(0, 0, 0);
     await renderer.xr.setSession(session);
     hud.classList.add("in-xr");
     [btnFlat, btnVR, btnAR].forEach((b) => b.classList.remove("active"));
@@ -955,13 +970,26 @@ window.addEventListener("keydown", (e) => {
 });
 window.addEventListener("keyup", (e) => keys.delete(e.code));
 
-// hold-drag look (desktop) — a plain click stays free to interact
-let dragging = false, lastX = 0, lastY = 0;
+// hold-drag look (desktop) — a plain click stays free to interact.
+// Pointer-id scoped: on mobile a second finger (the movement joystick) is
+// a separate, simultaneous touch stream. window-level pointermove/pointerup
+// fire for EVERY active pointer regardless of which element captured its
+// pointerdown, so without filtering by id, the joystick thumb's own moves
+// were leaking into yaw/pitch (or ending the drag early) during natural
+// two-thumb play — corrupting the camera direction the joystick's
+// movement is relative to, which is what read as "crooked" movement.
+let dragging = false, dragPointerId = null, lastX = 0, lastY = 0;
 let yaw = 0, pitch = 0;
 canvas.addEventListener("pointerdown", (e) => {
-  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  if (dragging) return; // a drag is already in progress on another pointer
+  dragging = true; dragPointerId = e.pointerId; lastX = e.clientX; lastY = e.clientY;
 });
-window.addEventListener("pointerup", () => { dragging = false; });
+function endDrag(e) {
+  if (e.pointerId !== dragPointerId) return;
+  dragging = false; dragPointerId = null;
+}
+window.addEventListener("pointerup", endDrag);
+window.addEventListener("pointercancel", endDrag);
 window.addEventListener("pointermove", (e) => {
   if (pointerLocked) {
     yaw -= e.movementX * 0.0022;
@@ -969,7 +997,7 @@ window.addEventListener("pointermove", (e) => {
     pitch = Math.max(-1.4, Math.min(1.4, pitch));
     return;
   }
-  if (!dragging) return;
+  if (!dragging || e.pointerId !== dragPointerId) return;
   const dx = e.clientX - lastX, dy = e.clientY - lastY;
   lastX = e.clientX; lastY = e.clientY;
   yaw -= dx * 0.0035;
@@ -1060,6 +1088,7 @@ window.addEventListener("deviceorientation", (e) => {
 
 // mobile on-screen joystick
 const joyWrap = document.getElementById("joystick-wrap");
+const joyBase = document.getElementById("joystick-base");
 const joyNub = document.getElementById("joystick-nub");
 let joyVec = { x: 0, y: 0 };
 let mobileVertical = 0; // -1/0/1 from the on-screen ascend/descend buttons
@@ -1068,9 +1097,15 @@ if (isCoarsePointer) {
   document.getElementById("controls-hint").textContent = "drag to look · joystick to fly";
   let joyActive = false, joyId = null, joyCenter = { x: 0, y: 0 };
   joyWrap.addEventListener("pointerdown", (e) => {
+    if (joyActive) return; // already tracking another touch
     joyActive = true; joyId = e.pointerId;
-    const r = joyWrap.getBoundingClientRect();
-    joyCenter = { x: r.left + r.width/2, y: r.top + r.height/2 };
+    // recentre the stick base to the actual touchdown point (not the
+    // widget's fixed geometric centre) — a thumb rarely lands dead-centre
+    // on a small on-screen control, and using the fixed centre as the
+    // zero-point biased every read off by however far the thumb missed it
+    joyCenter = { x: e.clientX, y: e.clientY };
+    joyBase.style.cssText = `position:fixed; left:${e.clientX - 55}px; top:${e.clientY - 55}px; right:auto; bottom:auto; width:110px; height:110px;`;
+    joyNub.style.cssText = `position:fixed; left:${e.clientX - 22}px; top:${e.clientY - 22}px; right:auto; bottom:auto;`;
     e.stopPropagation();
   });
   window.addEventListener("pointermove", (e) => {
@@ -1079,15 +1114,19 @@ if (isCoarsePointer) {
     const max = 35;
     const len = Math.hypot(dx, dy);
     if (len > max) { dx = dx / len * max; dy = dy / len * max; }
-    joyNub.style.left = `${33 + dx}px`;
-    joyNub.style.top = `${33 + dy}px`;
+    joyNub.style.left = `${joyCenter.x + dx - 22}px`;
+    joyNub.style.top = `${joyCenter.y + dy - 22}px`;
     joyVec = { x: dx / max, y: dy / max };
   });
-  window.addEventListener("pointerup", (e) => {
+  function endJoy(e) {
     if (e.pointerId !== joyId) return;
     joyActive = false; joyVec = { x: 0, y: 0 };
-    joyNub.style.left = "33px"; joyNub.style.top = "33px";
-  });
+    // dock back to the default (CSS-defined) idle position/appearance
+    joyBase.style.cssText = "";
+    joyNub.style.cssText = "";
+  }
+  window.addEventListener("pointerup", endJoy);
+  window.addEventListener("pointercancel", endJoy);
 
   // dedicated vertical (ascend/descend) buttons — mobile has no clean way to
   // fly straight up/down otherwise, since pitch is tied to look direction
@@ -1570,7 +1609,7 @@ renderer.setAnimationLoop((time, frame) => {
 
 initNodes();
 setInterval(erlangBeat, ERLANG_INTERVAL);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; } };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; } };
 </script>
 </body>
 </html>
