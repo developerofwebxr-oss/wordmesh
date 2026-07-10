@@ -108,14 +108,6 @@
   }
   .vert-btn.active { background: rgba(60,120,200,0.4); border-color: #7de0ff; color: #7de0ff; }
 
-  #node-info {
-    top: 60px; left: 16px; max-width: 240px; font-size: 12px;
-    background: rgba(6,9,18,0.65); border: 1px solid rgba(140,170,255,0.25);
-    padding: 8px 10px; border-radius: 8px; display: none;
-  }
-  #node-info.show { display: block; }
-  #node-info b { color: #7de0ff; }
-
   .xr-only { display: none; }
 </style>
 </head>
@@ -129,7 +121,6 @@
     <div id="mock-badge">MOCK DATA</div>
   </div>
 
-  <div id="node-info" class="panel"></div>
 
   <div class="panel" id="mode-switcher">
     <button class="mode-btn active" id="btn-flat">Screen</button>
@@ -1006,7 +997,11 @@ function flareNode(word, type, saleAddress) {
   n.flare = type === "sell" ? 0.35 : 0.9;
   const fromIdx = edgeTowardNode(n.index);
   if (fromIdx !== null) spawnPulse(fromIdx, n.index, n.baseColor.clone().lerp(new THREE.Color(0xffffff), 0.4), false);
-  updateNodeInfo(n, type);
+  // A live trade flares the node in 3D only. It must NOT write any readout:
+  // the selection panel is authoritative for the node the user picked, and a
+  // trade on some OTHER token used to overwrite the shared DOM readout (a
+  // different token, with a BUY/SELL prefix) — the "data changes on its own"
+  // desync. Trade activity gets its own feed in a later phase.
 }
 
 function onDataEvent(evt) {
@@ -1052,20 +1047,6 @@ async function startReplayLoop() {
   setInterval(schedule, REPLAY_LOOP_MS);
 }
 startReplayLoop();
-
-let lastInfoNode = null, infoTimeout = null;
-// type is optional: trade events pass 'buy'/'sell'; hover/select (Fix 1/2 —
-// this is the readout truncated labels resolve their full name through)
-// call it with no type for a plain name/price/volume readout.
-function updateNodeInfo(n, type) {
-  lastInfoNode = n;
-  const el = document.getElementById("node-info");
-  const prefix = type ? `${type.toUpperCase()} · ` : "";
-  el.innerHTML = `<b>${n.displayName}</b><br/>${prefix}price ${n.price.toFixed(4)} AE · vol24h ${Math.round(n.volume24h)}`;
-  el.classList.add("show");
-  clearTimeout(infoTimeout);
-  infoTimeout = setTimeout(() => el.classList.remove("show"), 2600);
-}
 
 const ERLANG_INTERVAL = 60000;
 let erlangTimer = 0;
@@ -1243,8 +1224,8 @@ window.addEventListener("pointermove", (e) => {
 // needed). VR/AR controller trigger sets the ray directly from the
 // controller's own pose (see pollVRSelection, further down). Every input
 // funnels into the SAME raycaster + selectFromRay() — one selection path,
-// one piece of state (selectedNodeIndex), feeding both the existing
-// #node-info DOM readout and the in-scene detail panel.
+// one piece of state (selectedNodeIndex), feeding the in-scene detail panel
+// (the single authoritative readout — there is no separate DOM readout).
 const raycaster = new THREE.Raycaster();
 const mouseNDC = new THREE.Vector2(-2, -2); // starts off-screen
 window.addEventListener("pointermove", (e) => {
@@ -1256,8 +1237,7 @@ window.addEventListener("pointermove", (e) => {
 // 2) — one selection path regardless of how a node was reached.
 function selectNode(n) {
   selectedNodeIndex = n.index;
-  updateNodeInfo(n);
-  openPanelFor(n);
+  openPanelFor(n); // the in-scene panel is the single authoritative readout
 }
 function selectFromRay() {
   const hit = raycaster.intersectObject(nodeMesh)[0];
@@ -1410,8 +1390,8 @@ canvas.addEventListener("pointerdown", hideHint, { once: true });
      priority — index 0 of `chosen`).
    - each label's canvas is sized exactly to its measured text (Fix 1: the
      pill can never be narrower than the text it holds); long tickers are
-     capped and shown with a real ellipsis, full name lives in the existing
-     #node-info readout on hover/select.
+     capped and shown with a real ellipsis; the full name lives in the
+     in-scene detail panel opened on select.
    - screen-space overlap is resolved every frame in priority order (higher
      vol24h / hover / select wins); a thin tether line + colour-matched dot
      + colour-tinted underline visually ties each label to its node.
@@ -1595,17 +1575,16 @@ function boxesOverlap(a, b) {
 }
 
 /* ============================================================
-   In-scene detail panel — world-space, works in Screen/VR/AR alike (the
-   DOM #node-info readout dies the instant an XR session starts — see
-   #hud.in-xr — so this is the detail view that survives immersion).
+   In-scene detail panel — world-space, works in Screen/VR/AR alike, and is
+   the SINGLE authoritative selection readout in every mode (there is no
+   separate DOM readout; a former top-left one was removed because live trade
+   events shared it and kept overwriting the selected token's data).
    Docked ~1.35m in front of the head on open, then world-locked: its
    POSITION doesn't chase the camera every frame (that would be nagging,
    not "docked"), only its ROTATION billboards around the vertical (Y)
    axis to keep facing the user as they move, per webxr-threejs billboard
-   guidance. Re-centers fresh each time a new node is opened. Fed by the
-   exact same selectedNodeIndex that drives #node-info — one selection
-   state, two presentations (DOM for quick Screen-mode hover, this panel
-   for the persistent everywhere-working detail view).
+   guidance. Re-centers fresh each time a new node is opened. Driven solely
+   by selectedNodeIndex / panelNodeIndex.
    ============================================================ */
 const PANEL_DPR = Math.min(window.devicePixelRatio || 1, 2);
 const PANEL_W_PX = 480 * PANEL_DPR, PANEL_H_PX = 300 * PANEL_DPR;
@@ -1728,11 +1707,17 @@ function openPanelFor(n) {
     panelHistory = null;
     if (dataMode === "live" && typeof source.getTokenHistory === "function" && n.saleAddress) {
       if (panelHistoryFetchedFor !== n.saleAddress) {
-        panelHistoryFetchedFor = n.saleAddress;
-        source.getTokenHistory(n.saleAddress).then((points) => {
-          if (panelNodeIndex === n.index) { // selection hasn't moved on while this was in flight
+        const reqSale = n.saleAddress; // tag this fetch with its token identity
+        panelHistoryFetchedFor = reqSale;
+        source.getTokenHistory(reqSale).then((points) => {
+          // Drop any response whose token is not the one currently selected.
+          // Keyed on sale_address, not node index: sale_address is the unique
+          // token id, and an out-of-order/late response for a token the user
+          // has already clicked away from must never clobber the open panel.
+          const cur = panelNodeIndex >= 0 ? nodeData[panelNodeIndex] : null;
+          if (cur && cur.saleAddress === reqSale) {
             panelHistory = points;
-            paintPanel(nodeData[n.index]);
+            paintPanel(cur);
           }
         }).catch(() => {});
       }
@@ -2497,9 +2482,10 @@ renderer.setAnimationLoop((time, frame) => {
     raycaster.setFromCamera(mouseNDC, camera);
     const hit = raycaster.intersectObject(nodeMesh)[0];
     const idx = (hit && hit.instanceId != null && nodeData[hit.instanceId] && nodeData[hit.instanceId].alive) ? hit.instanceId : -1;
+    // hover only promotes the node's label (via hoveredNodeIndex in the label
+    // ranking); it no longer writes a DOM readout — selection drives the panel
     if (idx !== hoveredNodeIndex) {
       hoveredNodeIndex = idx;
-      if (idx >= 0) updateNodeInfo(nodeData[idx]);
     }
   }
 
