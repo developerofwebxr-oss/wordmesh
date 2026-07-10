@@ -612,11 +612,27 @@ scene.add(nodeMesh);
 // window before the first snapshot populates any real nodes
 {
   const _setupTmp = new THREE.Object3D();
-  _setupTmp.position.set(0, -9999, 0);
+  // parked AT the origin, not far below it: scale 0.0001 already hides them,
+  // and an off-world park position wrecks the bounding sphere that
+  // refreshNodeBounds() has to keep tight (see below)
+  _setupTmp.position.set(0, 0, 0);
   _setupTmp.scale.setScalar(0.0001);
   _setupTmp.updateMatrix();
   for (let i = 0; i < NODE_COUNT; i++) nodeMesh.setMatrixAt(i, _setupTmp.matrix);
   nodeMesh.instanceMatrix.needsUpdate = true;
+}
+
+// InstancedMesh.raycast() broad-phase rejects against `boundingSphere` before
+// it ever tests an instance. Rendering no longer depends on it (frustumCulled
+// is false), but PICKING still does — with the stale parked sphere left over
+// from the hide-everything pass above, every tap ray missed and tapping a node
+// silently did nothing. Node positions change at runtime (reviveSlot), so this
+// is called after every build/revive rather than relying on three's one-shot
+// lazy compute. The pad covers a node's flare growth (up to +90% scale), which
+// happens per-frame and would otherwise poke outside a freshly computed sphere.
+function refreshNodeBounds() {
+  nodeMesh.computeBoundingSphere();
+  if (nodeMesh.boundingSphere) nodeMesh.boundingSphere.radius *= 1.15;
 }
 
 // distant LOD: point-sprite stand-ins, swapped in per-frame by hiding the
@@ -729,7 +745,7 @@ function buildNodesFromSnapshot(snap) {
   // unused instance slots (live mode may have fewer real tokens than
   // NODE_COUNT) — hide them, refreshInstances() only iterates nodeData
   for (let i = words.length; i < NODE_COUNT; i++) {
-    tmpObj.position.set(0, -9999, 0);
+    tmpObj.position.set(0, 0, 0);
     tmpObj.scale.setScalar(0.0001);
     tmpObj.updateMatrix();
     nodeMesh.setMatrixAt(i, tmpObj.matrix);
@@ -763,6 +779,7 @@ function buildNodesFromSnapshot(snap) {
     rig.position.z = Math.min(z, zCap);
   }
   refreshInstances();
+  refreshNodeBounds();
   buildEdges();
 }
 
@@ -1048,6 +1065,7 @@ function reviveSlot(n) {
   n.baseColor = new THREE.Color().setHSL(Math.random(), 0.75, 0.55);
   writeEmissiveAttributes(n.index, n.baseColor);
   n.alive = true; n.dying = false; n.spawnT = 0;
+  refreshNodeBounds(); // the node just moved — keep picking's broad-phase honest
 }
 
 /* ============================================================
@@ -1455,20 +1473,38 @@ function smoothstep01(edge0, edge1, x) {
 let hoveredNodeIndex = -1, selectedNodeIndex = -1;
 
 const LABEL_RECOMPUTE_MS = 350;
+const NEAR_LABEL_SLOTS = 6; // of labelPool.length, reserved for the closest nodes
+const _labelCamPos = new THREE.Vector3();
 let lastLabelRecompute = -Infinity;
 function updateVisibleLabels(time) {
   if (time - lastLabelRecompute < LABEL_RECOMPUTE_MS) return;
   lastLabelRecompute = time;
   for (const n of nodeData) n.isTopWord = false;
-  const ranked = nodeData.filter((n) => n.alive).sort((a, b) => b.volume24h - a.volume24h);
+  const alive = nodeData.filter((n) => n.alive);
+  const ranked = [...alive].sort((a, b) => b.volume24h - a.volume24h);
   const extraIdx = selectedNodeIndex >= 0 ? selectedNodeIndex : hoveredNodeIndex;
   const extraNode = extraIdx >= 0 && nodeData[extraIdx] && nodeData[extraIdx].alive ? nodeData[extraIdx] : null;
   const chosen = [];
-  if (extraNode) chosen.push(extraNode);
+  const taken = new Set();
+  const take = (n) => { if (!taken.has(n.index)) { taken.add(n.index); chosen.push(n); } };
+  if (extraNode) take(extraNode);
+  // Reserve slots for whatever you have flown up to. Ranking purely by
+  // volume meant a low-volume token could fill half the viewport with no
+  // word on it while a distant high-volume one stayed labelled — which
+  // reads as a broken label, not as a ranking. Nearest-first also gives
+  // these labels priority in the overlap pass below, since `chosen` is the
+  // priority order.
+  camera.getWorldPosition(_labelCamPos);
+  const byDist = [...alive].sort(
+    (a, b) => a.pos.distanceToSquared(_labelCamPos) - b.pos.distanceToSquared(_labelCamPos)
+  );
+  for (const n of byDist) {
+    if (chosen.length >= NEAR_LABEL_SLOTS + (extraNode ? 1 : 0)) break;
+    take(n);
+  }
   for (const n of ranked) {
     if (chosen.length >= labelPool.length) break;
-    if (extraNode && n.index === extraNode.index) continue;
-    chosen.push(n);
+    take(n);
   }
   for (const n of chosen) n.isTopWord = true;
   for (let i = 0; i < labelPool.length; i++) {
@@ -1808,11 +1844,23 @@ camera.add(searchButtonMesh);
 // ~0.198, so it hung off the screen edge and read as a clipped blob. Derive x
 // from the actual frustum instead, and re-derive it on resize/rotation.
 const SEARCH_BTN_Z = 0.5, SEARCH_BTN_MARGIN = 0.012;
+// #vert-wrap (the ascend/descend fly column) is fixed at right:20px bottom:20px
+// and is 148px tall, so the bottom-right ~190px of the viewport belongs to the
+// locomotion controls. The search button previously landed on top of the
+// up-arrow; keep it clear of that band instead of overlapping a control the
+// user's thumb needs.
+const SEARCH_BTN_BOTTOM_RESERVE_PX = 190;
 function positionSearchButton() {
+  const vv = window.visualViewport;
+  const vpH = vv ? vv.height : window.innerHeight;
   const halfH = SEARCH_BTN_Z * Math.tan((camera.fov * Math.PI / 180) / 2);
   const halfW = halfH * camera.aspect;
-  const x = Math.max(0, halfW - SEARCH_BTN_SIZE / 2 - SEARCH_BTN_MARGIN);
-  searchButtonMesh.position.set(x, -0.17, -SEARCH_BTN_Z);
+  const worldPerPx = (2 * halfH) / vpH;
+  const btnHalf = SEARCH_BTN_SIZE / 2;
+  const x = Math.max(0, halfW - btnHalf - SEARCH_BTN_MARGIN);
+  const yFloor = -halfH + SEARCH_BTN_BOTTOM_RESERVE_PX * worldPerPx + btnHalf;
+  const y = Math.min(halfH - btnHalf - SEARCH_BTN_MARGIN, yFloor);
+  searchButtonMesh.position.set(x, y, -SEARCH_BTN_Z);
 }
 positionSearchButton();
 
@@ -2404,11 +2452,28 @@ renderer.setAnimationLoop((time, frame) => {
     const dist = camPos.distanceTo(n.pos);
     // scale up with distance (counteracts perspective shrink) so it stays
     // legible from across the mesh, clamped so it doesn't balloon or vanish
-    const distMul = Math.min(2.2, Math.max(0.85, dist / 24)) * labelSizeBoost;
-    const distOpacity = smoothstep01(2, 6, dist) * (1 - smoothstep01(85, 120, dist));
+    // On-screen label height is proportional to distMul/dist, so the dist/24
+    // term holds it constant as you move. The old 0.85 floor kicked in below
+    // ~20 units and stopped that compensation, which nobody noticed while near
+    // nodes were never labelled — now that they are, it blew a close-up word up
+    // to ~170px tall and clipped it off both screen edges. Floor low enough to
+    // stay in the proportional regime; the 2.2 cap still stops far labels
+    // ballooning past the fog line.
+    const distMul = Math.min(2.2, Math.max(0.10, dist / 24)) * labelSizeBoost;
+    // Near fade used to be a fixed 2..6 band, tuned when every node was small.
+    // A big node's surface already reaches ~1.1 world units, so flying up to it
+    // put the camera inside the fade band and the word dissolved exactly when
+    // you wanted to read it. Fade relative to the node's own radius instead.
+    const nodeR = n.scale * 0.55; // matches the instance scale in refreshInstances()
+    const nearIn = nodeR * 1.25, nearOut = nearIn + 1.2;
+    const distOpacity = smoothstep01(nearIn, nearOut, dist) * (1 - smoothstep01(85, 120, dist));
     if (distOpacity <= 0.01) { entry.sprite.visible = false; continue; }
 
-    _labelOffset.set(0, 1.25 * n.scale + 0.5, 0);
+    // Anchor the word above the sphere, but never so far above that it leaves
+    // the frustum: at close range a fixed world-space offset subtends a huge
+    // angle (a 2.94-unit offset at 3.4 units out is 41 deg, past the 31 deg
+    // half-fov), which is the other half of "the word doesn't come above it".
+    _labelOffset.set(0, Math.max(nodeR * 1.15, Math.min(1.25 * n.scale + 0.5, dist * 0.32)), 0);
     _labelCenter.copy(n.pos).add(_labelOffset);
     _projB.copy(_labelCenter).project(camera);
     if (_projB.z > 1) { entry.sprite.visible = false; continue; } // behind camera
