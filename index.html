@@ -99,6 +99,26 @@
     padding-top: calc(10px + env(safe-area-inset-top)); backdrop-filter: blur(6px);
   }
   #btn-exit-xr.show { display: block; }
+  #tip-prompt {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: min(90vw, 340px); z-index: 20; display: none; pointer-events: auto; text-align: center;
+    background: rgba(6,12,10,0.95); border: 1px solid rgba(50,220,140,0.6); border-radius: 16px;
+    padding: 22px 20px; color: #eaffe8; font-size: 16px; backdrop-filter: blur(10px);
+  }
+  #tip-prompt.show { display: block; }
+  #tip-prompt b { color: #8affc4; }
+  #tip-prompt #tip-prompt-name { word-break: break-all; }
+  #tip-prompt-sub { font-size: 12px; color: rgba(200,230,215,0.7); margin-top: 8px; }
+  #tip-prompt-actions { display: flex; gap: 10px; margin-top: 18px; }
+  #tip-prompt-actions .pill-btn { flex: 1; padding: 12px; font-size: 14px; }
+  #tip-send { background: rgba(50,220,140,0.22); border-color: rgba(50,220,140,0.6); color: #8affc4; }
+  #tip-toast {
+    position: fixed; left: 50%; top: 76px; transform: translateX(-50%);
+    z-index: 19; display: none; pointer-events: none; white-space: nowrap;
+    background: rgba(6,12,10,0.9); border: 1px solid rgba(50,220,140,0.5); border-radius: 20px;
+    padding: 9px 18px; color: #8affc4; font-size: 13px; font-weight: 700; backdrop-filter: blur(6px);
+  }
+  #tip-toast.show { display: block; }
   #wallet-help {
     position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%);
     width: min(92vw, 360px); z-index: 13; display: none; pointer-events: auto;
@@ -181,6 +201,15 @@
 <div id="joystick-wrap"><div id="joystick-base"></div><div id="joystick-nub"></div></div>
 <div id="vert-wrap"><button class="vert-btn" id="btn-up">&#9650;</button><button class="vert-btn" id="btn-down">&#9660;</button></div>
 <button id="btn-exit-xr">Exit AR</button>
+<div id="tip-prompt">
+  <div id="tip-prompt-text">Send <b><span id="tip-prompt-amount">10</span> AE</b> to <b id="tip-prompt-name"></b>?</div>
+  <div id="tip-prompt-sub">A mainnet transaction — your wallet will ask you to sign.</div>
+  <div id="tip-prompt-actions">
+    <button class="pill-btn" id="tip-send">Send 10 AE</button>
+    <button class="pill-btn" id="tip-cancel">Cancel</button>
+  </div>
+</div>
+<div id="tip-toast"></div>
 <div id="wallet-help">
   <div id="wallet-help-text">On mobile, connect inside the <b>Superhero Wallet app</b>: open the app → its <b>Browser</b> tab → open this page. A normal mobile browser can't reach the wallet.</div>
   <div id="wallet-help-actions">
@@ -1448,7 +1477,11 @@ function selectNode(n) {
   openPanelFor(n); // the in-scene panel is the single authoritative readout
 }
 function selectFromRay() {
+  // A remote avatar wins over a node if it's the nearer hit — pointing at a
+  // person opens the tip prompt (Phase C). tipRemoteAvatar is defined below.
+  const av = typeof pickTipTarget === "function" ? pickTipTarget() : null;
   const hit = raycaster.intersectObject(nodeMesh)[0];
+  if (av && (!hit || av.distance < hit.distance)) { openTipPrompt(av); return; }
   if (hit && hit.instanceId != null && nodeData[hit.instanceId] && nodeData[hit.instanceId].alive) {
     selectNode(nodeData[hit.instanceId]);
   } else if (selectedNodeIndex >= 0) {
@@ -2850,6 +2883,7 @@ renderer.setAnimationLoop((time, frame) => {
   if (scaleLerpActive) refreshNodeBounds();
   updateBuyToasts(dt);
   updatePresence(dt);
+  updateTipBeams(dt);
 
   // pulses
   let pulseInstanceCount = 0;
@@ -3078,7 +3112,8 @@ async function resolveChainName(address) {
 // imported only on click (heavy dep, off the initial-load path). `?mockwallet=1`
 // forces a deterministic demo identity — used for headless/testing (no extension
 // exists there) and for a wallet-less demo. Mainnet.
-const MOCK_AE_ADDRESS = "ak_wordmeshDemoJ1qP7v9rT4kS2mN8xC5bZ3hL6dW0fY";
+// unique per load so two demo clients are distinguishable (real addresses are unique)
+const MOCK_AE_ADDRESS = "ak_wordmeshDemo" + Math.random().toString(36).slice(2, 10) + "Q7v9rT4kS2mN8xC5bZ";
 const AE_MAINNET = "https://mainnet.aeternity.io";
 // Self-contained aepp-sdk@14.1.1 bundle, VENDORED same-origin (see vendor/).
 // A runtime CDN import (jsdelivr/esm.sh) failed for some users' desktop Chrome
@@ -3277,11 +3312,20 @@ function upsertRemote(id, p, yaw, name, seed) {
     const nameSprite = makeNameLabel(name || id); nameSprite.position.y = 2.05; group.add(nameSprite);
     scene.add(group);
     e = { group, target: new THREE.Vector3(p[0], p[1], p[2]), targetYaw: yaw, nameSprite, name, seed: s };
+    group.userData = { avatarSeed: s, avatarName: name }; // for tip-target picking
     group.position.set(p[0], p[1], p[2]); group.rotation.y = yaw; // snap on first appearance
     remoteAvatars.set(id, e);
   }
   e.target.set(p[0], p[1], p[2]); e.targetYaw = yaw;
-  if (name && name !== e.name) { e.name = name; paintNameLabel(e.nameSprite.userData.cnv, name); e.nameSprite.userData.tex.needsUpdate = true; }
+  if (name && name !== e.name) { e.name = name; e.group.userData.avatarName = name; paintNameLabel(e.nameSprite.userData.cnv, name); e.nameSprite.userData.tex.needsUpdate = true; }
+  // a peer that connects a wallet mid-session changes identity guest→ak_; keep
+  // the seed live so tips route to their real address (and refresh the keyface)
+  const s2 = seed || id;
+  if (s2 !== e.seed) {
+    e.seed = s2; e.group.userData.avatarSeed = s2;
+    const face = e.group.getObjectByName("faceMount");
+    if (face && face.material.map) { drawKeyface(s2, 96, face.material.map.image); face.material.map.needsUpdate = true; }
+  }
 }
 function removeRemote(id) { const e = remoteAvatars.get(id); if (e) { scene.remove(e.group); remoteAvatars.delete(id); } }
 function updateRemoteAvatars(dt) {
@@ -3301,6 +3345,7 @@ function connectRelay() {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     if (m.t === "presence" && Array.isArray(m.p)) { lastSeen.set(m.id, performance.now()); upsertRemote(m.id, m.p, m.yaw || 0, m.name, m.seed); }
     else if (m.t === "leave") { removeRemote(m.id); lastSeen.delete(m.id); }
+    else if (m.t === "tip") { onTipEvent(m.from, m.to, m.amount); }
   });
   relaySocket.addEventListener("close", () => { relaySocket = null; clearTimeout(relayReconnect); relayReconnect = setTimeout(connectRelay, 3000); });
   relaySocket.addEventListener("error", () => {});
@@ -3320,7 +3365,102 @@ function updatePresence(dt) {
   }
 }
 connectRelay();
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, shortName, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip, get remoteCount() { return remoteAvatars.size; }, get remoteAvatars() { return remoteAvatars; }, RELAY_URL, get relayReady() { return !!relaySocket && relaySocket.readyState === 1; } };
+
+/* ============================================================
+   Presence Phase C — tip a person 10 AE. Tap an embodied peer → an explicit
+   "Send 10 AE to <name>?" confirm → the wallet signs a MAINNET spend (never
+   automatic) → a tipper→target beam fires and the recipient sees a received
+   effect. Only peers with an on-chain address (wallet-connected, seed starts
+   `ak_`) can be tipped; spectators (guest ids) can't receive AE. The tip is
+   relayed so onlookers + the recipient see it. `?mockwallet=1` mocks the sign.
+   ============================================================ */
+const TIP_AMOUNT_AE = 10;
+const tipPrompt = document.getElementById("tip-prompt");
+const tipPromptName = document.getElementById("tip-prompt-name");
+const tipPromptAmount = document.getElementById("tip-prompt-amount");
+const tipPromptSend = document.getElementById("tip-send");
+const tipPromptCancel = document.getElementById("tip-cancel");
+const tipToast = document.getElementById("tip-toast");
+tipPromptAmount.textContent = TIP_AMOUNT_AE;
+function pickTipTarget() {
+  if (!remoteAvatars.size) return null;
+  const groups = []; for (const e of remoteAvatars.values()) groups.push(e.group);
+  const hits = raycaster.intersectObjects(groups, true);
+  if (!hits.length) return null;
+  let o = hits[0].object; while (o && !(o.userData && o.userData.avatarSeed)) o = o.parent;
+  if (!o) return null;
+  const seed = o.userData.avatarSeed || "";
+  if (!/^ak_/.test(seed)) return null; // spectators can't receive AE
+  return { seed, name: o.userData.avatarName || seed, group: o, distance: hits[0].distance };
+}
+const _tipA = new THREE.Vector3(), _tipB = new THREE.Vector3();
+function myBodyPos() { return new THREE.Vector3(rig.position.x, rig.position.y + 1.0, rig.position.z); }
+function avatarBodyPos(g) { return new THREE.Vector3(g.position.x, g.position.y + 1.0, g.position.z); }
+function openTipPrompt(target) {
+  if (!wallet.connected) { showTipToast("Connect your Superhero Wallet to tip"); return; }
+  tipPromptName.textContent = shortName(target.name, 22);
+  tipPrompt._target = target; tipPrompt.classList.add("show");
+}
+function closeTipPrompt() { tipPrompt.classList.remove("show"); tipPrompt._target = null; }
+async function confirmTip() {
+  const target = tipPrompt._target; closeTipPrompt();
+  if (!target || !wallet.connected) return;
+  showTipToast("Signing " + TIP_AMOUNT_AE + " AE…");
+  try {
+    let txHash;
+    if (new URLSearchParams(location.search).get("mockwallet") === "1") {
+      await new Promise((r) => setTimeout(r, 300)); txHash = "th_mock" + Date.now().toString(36);
+    } else {
+      // REAL mainnet 10 AE spend — the wallet prompts the user to sign. Explicit,
+      // one-off, never automatic.
+      const res = await wallet._sdk.spend(TIP_AMOUNT_AE, target.seed, { denomination: "ae" });
+      txHash = (res && (res.hash || (res.tx && res.tx.hash))) || "";
+    }
+    fireTipBeam(myBodyPos(), avatarBodyPos(target.group));
+    showTipToast("Sent " + TIP_AMOUNT_AE + " AE to " + shortName(target.name, 16) + " ✓");
+    if (relaySocket && relaySocket.readyState === 1)
+      relaySocket.send(JSON.stringify({ t: "tip", from: presenceIdentity().seed, to: target.seed, amount: TIP_AMOUNT_AE, txHash }));
+  } catch (e) { console.warn("[tip] failed:", e && e.message || e); showTipToast("Tip cancelled / failed"); }
+}
+function onTipEvent(from, to, amount) {
+  const mySeed = presenceIdentity().seed;
+  let fromPos = null, toPos = null;
+  for (const e of remoteAvatars.values()) { if (e.seed === from) fromPos = avatarBodyPos(e.group); if (e.seed === to) toPos = avatarBodyPos(e.group); }
+  if (to === mySeed) toPos = myBodyPos();
+  if (fromPos && toPos) fireTipBeam(fromPos, toPos);
+  if (to === mySeed) showTipToast("Received " + amount + " AE from " + shortName(from, 12) + " ✦");
+}
+const TIP_BEAM_LIFE = 1.4;
+const _tipSparkGeo = new THREE.SphereGeometry(0.14, 10, 10);
+const _tipBeams = [];
+function fireTipBeam(a, b) {
+  const geo = new THREE.BufferGeometry().setFromPoints([a.clone(), b.clone()]);
+  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0x32dc8c, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
+  line.renderOrder = 24; scene.add(line);
+  const spark = new THREE.Mesh(_tipSparkGeo, new THREE.MeshBasicMaterial({ color: 0x8affc4, transparent: true, opacity: 1, blending: THREE.AdditiveBlending, depthWrite: false }));
+  scene.add(spark);
+  _tipBeams.push({ line, spark, a: a.clone(), b: b.clone(), t: 0 });
+}
+function updateTipBeams(dt) {
+  if (!_tipBeams.length) return;
+  for (let i = _tipBeams.length - 1; i >= 0; i--) {
+    const T = _tipBeams[i]; T.t += dt; const k = T.t / TIP_BEAM_LIFE;
+    if (k >= 1) { scene.remove(T.line); scene.remove(T.spark); T.line.material.dispose(); T.line.geometry.dispose(); T.spark.material.dispose(); _tipBeams.splice(i, 1); continue; }
+    T.line.material.opacity = 0.9 * (1 - k);
+    const travel = Math.min(1, k / 0.55);
+    T.spark.position.copy(_tipA.lerpVectors(T.a, T.b, travel));
+    T.spark.material.opacity = travel < 1 ? 1 : Math.max(0, 1 - (k - 0.55) / 0.45);
+    T.spark.scale.setScalar(1 + Math.sin(Math.min(1, k) * Math.PI) * 0.8);
+  }
+}
+let _tipToastTimer = null;
+function showTipToast(text) {
+  tipToast.textContent = text; tipToast.classList.add("show");
+  clearTimeout(_tipToastTimer); _tipToastTimer = setTimeout(() => tipToast.classList.remove("show"), 3200);
+}
+tipPromptSend.addEventListener("click", confirmTip);
+tipPromptCancel.addEventListener("click", closeTipPrompt);
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, shortName, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip, get remoteCount() { return remoteAvatars.size; }, get remoteAvatars() { return remoteAvatars; }, RELAY_URL, get relayReady() { return !!relaySocket && relaySocket.readyState === 1; }, openTipPrompt, confirmTip, get tipBeamCount() { return _tipBeams.length; }, get tipToast() { return { text: tipToast.textContent, shown: tipToast.classList.contains("show") }; }, TIP_AMOUNT_AE };
 </script>
 </body>
 </html>

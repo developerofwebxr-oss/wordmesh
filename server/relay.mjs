@@ -24,6 +24,11 @@ wss.on("connection", (ws) => {
     if (m.t === "presence") {
       // trust the server-assigned id, not the client's claim (unspoofable here)
       bcast(ws, { t: "presence", id, p: m.p, yaw: m.yaw, name: m.name, seed: m.seed });
+    } else if (m.t === "tip") {
+      // a confirmed 10 AE tip — rebroadcast so peers draw the beam + the
+      // recipient sees the received effect. Identity fields are the on-chain
+      // addresses (from/to); `id` is the sender's socket for provenance.
+      bcast(ws, { t: "tip", id, from: m.from, to: m.to, amount: m.amount, txHash: m.txHash });
     }
   });
   ws.on("close", () => { ids.delete(ws); bcast(ws, { t: "leave", id }); });
