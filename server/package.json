@@ -1,0 +1,9 @@
+{
+  "name": "wordmesh-relay",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": { "start": "node relay.mjs" },
+  "dependencies": { "ws": "^8.18.0" },
+  "engines": { "node": ">=18" }
+}

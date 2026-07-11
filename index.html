@@ -2831,6 +2831,7 @@ renderer.setAnimationLoop((time, frame) => {
   // and only while a size ease is in flight)
   if (scaleLerpActive) refreshNodeBounds();
   updateBuyToasts(dt);
+  updatePresence(dt);
 
   // pulses
   let pulseInstanceCount = 0;
@@ -3109,7 +3110,103 @@ btnWallet.addEventListener("click", async () => {
   finally { btnWallet.disabled = false; }
 });
 // Spectator is the default — nothing to do until the user connects.
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip };
+
+/* ============================================================
+   Presence Phase B — see each other. A 6 Hz heartbeat of pose+identity over a
+   WebSocket relay (the one backend); inbound peers drive remote avatars (the
+   full pill body + cut-sphere head + keyface, + a name label), smoothed toward
+   their reported pose. Works in spectator (a per-session guest id) AND with a
+   wallet (.chain identity). Relay URL is configurable (?relay= or DEFAULT_RELAY)
+   so hosting can change without a code change; empty = presence off (solo).
+   ============================================================ */
+const DEFAULT_RELAY = ""; // set to your deployed wss:// URL, or pass ?relay=…
+const RELAY_URL = new URLSearchParams(location.search).get("relay") || DEFAULT_RELAY;
+const PRESENCE_HZ = 6, PRESENCE_STALE_MS = 4000;
+const sessionSeed = "guest-" + Math.random().toString(36).slice(2, 7);
+function presenceIdentity() {
+  return wallet.connected
+    ? { name: wallet.chainName || shortAddr(wallet.address), seed: wallet.address }
+    : { name: sessionSeed, seed: sessionSeed };
+}
+const _poseQ = new THREE.Quaternion(), _poseE = new THREE.Euler(), _poseP = new THREE.Vector3();
+function getLocalPose() {
+  camera.getWorldPosition(_poseP);
+  camera.getWorldQuaternion(_poseQ); _poseE.setFromQuaternion(_poseQ, "YXZ");
+  return { x: _poseP.x, y: rig.position.y, z: _poseP.z, yaw: _poseE.y };
+}
+const _round3 = (n) => Math.round(n * 1000) / 1000;
+
+function paintNameLabel(cnv, text) {
+  const ctx = cnv.getContext("2d"), W = cnv.width, H = cnv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.font = "700 30px -apple-system, sans-serif";
+  const tw = Math.min(W - 8, ctx.measureText(text).width + 32), bx = (W - tw) / 2;
+  ctx.fillStyle = "rgba(6,12,10,0.8)"; ctx.beginPath(); ctx.roundRect(bx, 10, tw, 44, 22); ctx.fill();
+  ctx.strokeStyle = "#8affc4"; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(bx + 1, 11, tw - 2, 42, 21); ctx.stroke();
+  ctx.fillStyle = "#eaffe8"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(text, W / 2, 33);
+}
+function makeNameLabel(text) {
+  const cnv = document.createElement("canvas"); cnv.width = 256; cnv.height = 64;
+  paintNameLabel(cnv, text);
+  const tex = new THREE.CanvasTexture(cnv); tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false }));
+  sp.scale.set(1.7, 0.42, 1); sp.userData = { cnv, tex };
+  return sp;
+}
+const remoteAvatars = new Map(); // id -> { group, target, targetYaw, nameSprite, name, seed }
+function upsertRemote(id, p, yaw, name, seed) {
+  let e = remoteAvatars.get(id);
+  if (!e) {
+    const s = seed || id;
+    const group = makeAvatar(avatarColorFor(s), drawKeyface(s, 96), { withHead: true }); // FULL avatar for remotes
+    const nameSprite = makeNameLabel(name || id); nameSprite.position.y = 2.05; group.add(nameSprite);
+    scene.add(group);
+    e = { group, target: new THREE.Vector3(p[0], p[1], p[2]), targetYaw: yaw, nameSprite, name, seed: s };
+    group.position.set(p[0], p[1], p[2]); group.rotation.y = yaw; // snap on first appearance
+    remoteAvatars.set(id, e);
+  }
+  e.target.set(p[0], p[1], p[2]); e.targetYaw = yaw;
+  if (name && name !== e.name) { e.name = name; paintNameLabel(e.nameSprite.userData.cnv, name); e.nameSprite.userData.tex.needsUpdate = true; }
+}
+function removeRemote(id) { const e = remoteAvatars.get(id); if (e) { scene.remove(e.group); remoteAvatars.delete(id); } }
+function updateRemoteAvatars(dt) {
+  const t = Math.min(1, dt * 8);
+  for (const e of remoteAvatars.values()) {
+    e.group.position.lerp(e.target, t);
+    let d = e.targetYaw - e.group.rotation.y; d = Math.atan2(Math.sin(d), Math.cos(d)); e.group.rotation.y += d * t;
+  }
+}
+let relaySocket = null, relayReconnect = null;
+const lastSeen = new Map();
+let presenceAcc = 0;
+function connectRelay() {
+  if (!RELAY_URL) return; // presence disabled until a relay is configured
+  try { relaySocket = new WebSocket(RELAY_URL); } catch { return; }
+  relaySocket.addEventListener("message", (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.t === "presence" && Array.isArray(m.p)) { lastSeen.set(m.id, performance.now()); upsertRemote(m.id, m.p, m.yaw || 0, m.name, m.seed); }
+    else if (m.t === "leave") { removeRemote(m.id); lastSeen.delete(m.id); }
+  });
+  relaySocket.addEventListener("close", () => { relaySocket = null; clearTimeout(relayReconnect); relayReconnect = setTimeout(connectRelay, 3000); });
+  relaySocket.addEventListener("error", () => {});
+}
+function updatePresence(dt) {
+  // prune peers we stopped hearing from, then smooth the rest
+  const now = performance.now();
+  for (const [id, ts] of lastSeen) if (now - ts > PRESENCE_STALE_MS) { removeRemote(id); lastSeen.delete(id); }
+  updateRemoteAvatars(dt);
+  // throttled outbound heartbeat
+  if (!relaySocket || relaySocket.readyState !== 1) return;
+  presenceAcc += dt * 1000;
+  if (presenceAcc >= 1000 / PRESENCE_HZ) {
+    presenceAcc = 0;
+    const pose = getLocalPose(), idn = presenceIdentity();
+    relaySocket.send(JSON.stringify({ t: "presence", p: [_round3(pose.x), _round3(pose.y), _round3(pose.z)], yaw: _round3(pose.yaw), name: idn.name, seed: idn.seed }));
+  }
+}
+connectRelay();
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip, get remoteCount() { return remoteAvatars.size; }, get remoteAvatars() { return remoteAvatars; }, RELAY_URL, get relayReady() { return !!relaySocket && relaySocket.readyState === 1; } };
 </script>
 </body>
 </html>
