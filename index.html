@@ -3062,7 +3062,13 @@ async function resolveChainName(address) {
 // exists there) and for a wallet-less demo. Mainnet.
 const MOCK_AE_ADDRESS = "ak_wordmeshDemoJ1qP7v9rT4kS2mN8xC5bZ3hL6dW0fY";
 const AE_MAINNET = "https://mainnet.aeternity.io";
-const AEPP_SDK_URL = "https://cdn.jsdelivr.net/npm/@aeternity/aepp-sdk@14/+esm";
+// Self-contained aepp-sdk@14.1.1 bundle, VENDORED same-origin (see vendor/).
+// A runtime CDN import (jsdelivr/esm.sh) failed for some users' desktop Chrome
+// ("SDK failed to load" before any wallet detection) — an adblocker / proxy /
+// extension / CDN-variance issue we can't control. Same-origin removes all of
+// that. `import.meta.url` keeps it correct under the GitHub Pages `/wordmesh/`
+// base path.
+const AEPP_SDK_URL = new URL("./vendor/aepp-sdk.bundle.js", import.meta.url).href;
 let _aeppSdkPromise = null;
 const loadAeppSdk = () => (_aeppSdkPromise ||= import(AEPP_SDK_URL));
 const wallet = {
@@ -3157,7 +3163,8 @@ function unembody() {
 }
 const WALLET_ERR_LABEL = {
   "sdk-load": "SDK failed to load",
-  "no-wallet": "No Superhero Wallet found",
+  // mobile has no extension — the wallet lives inside the Superhero app's browser
+  "no-wallet": () => isCoarsePointer ? "Open in Superhero app browser" : "No Superhero Wallet found",
   "connect-failed": "Wallet rejected connection",
   "detector": "Wallet detector error",
 };
@@ -3170,7 +3177,8 @@ btnWallet.addEventListener("click", async () => {
   } catch (err) {
     // full detail to the console so the user can screenshot the exact reason
     console.error("[SuperheroWallet] connect failed —", err.code || "unknown", "—", err.message, "\ncause:", err.cause || err);
-    btnWallet.textContent = WALLET_ERR_LABEL[err.code] || "Connect failed (see console)";
+    const lbl = WALLET_ERR_LABEL[err.code];
+    btnWallet.textContent = (typeof lbl === "function" ? lbl() : lbl) || "Connect failed (see console)";
     setTimeout(() => { if (!wallet.connected) btnWallet.textContent = "Connect Superhero Wallet"; }, 6000);
   } finally { btnWallet.disabled = false; }
 });
