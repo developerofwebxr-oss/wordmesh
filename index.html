@@ -1821,7 +1821,8 @@ function updatePanel(time) {
    approach (measure text, size the canvas exactly to it, no clipping).
    ============================================================ */
 const statusChipCanvas = document.createElement("canvas");
-const statusChipTex = new THREE.CanvasTexture(statusChipCanvas);
+let statusChipTex = new THREE.CanvasTexture(statusChipCanvas);
+let statusChipTexW = 0, statusChipTexH = 0;
 statusChipTex.colorSpace = THREE.SRGBColorSpace;
 const statusChipMat = new THREE.SpriteMaterial({ map: statusChipTex, transparent: true, depthTest: false, depthWrite: false });
 const statusChip = new THREE.Sprite(statusChipMat);
@@ -1848,7 +1849,21 @@ function paintStatusChip(text, color) {
   ctx.font = `700 ${20 * dpr}px -apple-system, sans-serif`;
   ctx.textAlign = "center"; ctx.textBaseline = "middle";
   ctx.fillText(text, w / 2, h / 2 + 1);
-  statusChipTex.needsUpdate = true;
+  // Same resize-under-old-CanvasTexture trap fixed for node labels: the chip
+  // canvas is re-sized to fit each state's text, and three re-uploads a resized
+  // canvas via texSubImage2D against the old, smaller storage ("Offset overflows
+  // texture dimensions") — the upload is rejected and the chip keeps stale
+  // glyphs. Recreate the texture when the size changes so three re-allocates.
+  if (w !== statusChipTexW || h !== statusChipTexH) {
+    statusChipTex.dispose();
+    statusChipTex = new THREE.CanvasTexture(statusChipCanvas);
+    statusChipTex.colorSpace = THREE.SRGBColorSpace;
+    statusChipMat.map = statusChipTex;
+    statusChipMat.needsUpdate = true;
+    statusChipTexW = w; statusChipTexH = h;
+  } else {
+    statusChipTex.needsUpdate = true;
+  }
   const worldH = 0.03;
   statusChip.scale.set(worldH * (w / h), worldH, 1);
 }
@@ -2029,7 +2044,16 @@ function makeKeyLabelSprite(text) {
   ctx.fillText(text, size / 2, size / 2 + 1);
   const tex = new THREE.CanvasTexture(cnv);
   tex.colorSpace = THREE.SRGBColorSpace;
-  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
+  // depthTest:false is the fix for "the bottom of the letter looks greyed out":
+  // the key boxes are semi-transparent (opacity 0.85) AND write depth, and this
+  // billboarded label sits only KEY_SIZE*0.02 in front of a box face while being
+  // KEY_SIZE*0.7 tall — so any view tilt swings the sprite's lower half behind
+  // the box plane, where it failed the depth test and showed the dark box
+  // through it. Not the label-canvas resize bug (these key canvases are a fixed
+  // size, painted once); a genuine depth/transparency interaction. renderOrder
+  // keeps the letters drawing after the boxes.
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false }));
+  sprite.renderOrder = 3;
   const worldSize = KEY_SIZE * 0.7;
   sprite.scale.set(worldSize, worldSize, 1);
   return sprite;
