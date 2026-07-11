@@ -3155,7 +3155,11 @@ btnWallet.addEventListener("click", async () => {
    wallet (.chain identity). Relay URL is configurable (?relay= or DEFAULT_RELAY)
    so hosting can change without a code change; empty = presence off (solo).
    ============================================================ */
-const DEFAULT_RELAY = ""; // set to your deployed wss:// URL, or pass ?relay=…
+// Deployed presence relay (Railway). `?relay=wss://…` overrides it; "" would
+// disable presence (solo). Verified live: wss handshake + two-client sync +
+// prune-on-leave. Note: Railway can cold-start — after a load the first peers
+// may take a few seconds to appear (the client auto-reconnects, self-healing).
+const DEFAULT_RELAY = "wss://wordmesh-production.up.railway.app";
 const RELAY_URL = new URLSearchParams(location.search).get("relay") || DEFAULT_RELAY;
 const PRESENCE_HZ = 6, PRESENCE_STALE_MS = 4000;
 const sessionSeed = "guest-" + Math.random().toString(36).slice(2, 7);
