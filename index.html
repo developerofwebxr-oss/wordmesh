@@ -138,7 +138,6 @@
     <div id="left-controls">
       <button class="pill-btn on" id="btn-fly">Fly: ON</button>
       <button class="pill-btn" id="btn-freelook">Free look: OFF</button>
-      <button class="pill-btn" id="btn-comfort-fade">Comfort fade: OFF</button>
     </div>
     <div id="footer-link">
       <a href="https://github.com/developerofwebxr-oss/wordmesh?ref=wordmesh" target="_blank" rel="noopener">wordmesh · repo</a>
@@ -2141,11 +2140,10 @@ function pressKey(key) {
   paintSearchPanel();
 }
 
-// ---- teleport (quick-fly to a search result) + opt-in comfort fade ----
+// ---- teleport (quick-fly to a search result) ----
 const TELEPORT_FRAMING_DIST = 8;
 const TELEPORT_DURATION = 1.0;
-let teleportAnim = null; // { from, to, t, node } — visible ease-in-out dolly (default)
-let fadeAnim = null;     // { phase: 'out'|'in', t, target, node } — opt-in comfort mode
+let teleportAnim = null; // { from, to, t, node } — visible ease-in-out dolly
 const _teleportDir = new THREE.Vector3();
 function computeTeleportTarget(n) {
   _teleportDir.subVectors(rig.position, n.pos);
@@ -2159,33 +2157,8 @@ function computeTeleportTarget(n) {
 function selectSearchResult(n) {
   closeSearch();
   const target = computeTeleportTarget(n);
-  if (comfortFadeEnabled) {
-    fadeAnim = { phase: "out", t: 0, target, node: n };
-  } else {
-    teleportAnim = { from: rig.position.clone(), to: target, t: 0, node: n };
-  }
+  teleportAnim = { from: rig.position.clone(), to: target, t: 0, node: n };
 }
-
-let comfortFadeEnabled = localStorage.getItem("wm_comfort_fade") === "1";
-const btnComfortFade = document.getElementById("btn-comfort-fade");
-function setComfortFade(on) {
-  comfortFadeEnabled = on;
-  btnComfortFade.textContent = `Comfort fade: ${on ? "ON" : "OFF"}`;
-  btnComfortFade.classList.toggle("on", on);
-  localStorage.setItem("wm_comfort_fade", on ? "1" : "0");
-}
-setComfortFade(comfortFadeEnabled);
-btnComfortFade.addEventListener("click", () => setComfortFade(!comfortFadeEnabled));
-
-// in-scene fade plane (camera-attached, not a DOM overlay — a DOM overlay
-// would be invisible inside a headset, defeating the point) — just beyond
-// the near clip plane, oversized so it covers the full FOV at any aspect
-const fadeMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0, depthTest: false, depthWrite: false });
-const fadeMesh = new THREE.Mesh(new THREE.PlaneGeometry(4, 4), fadeMat);
-fadeMesh.position.set(0, 0, -0.11);
-fadeMesh.renderOrder = 999;
-fadeMesh.visible = false;
-camera.add(fadeMesh);
 
 // ---- unified selection dispatch — search button/keyboard/match-list take
 // priority over node selection when relevant, otherwise falls through to
@@ -2247,7 +2220,6 @@ resize();
    raycaster + selectFromRay() as mouse/tap — one selection path.
    ============================================================ */
 let flyClickPrev = false;
-let leftXClickPrev = false;
 let snapCooldown = 0;
 const controllerRays = [renderer.xr.getController(0), renderer.xr.getController(1)];
 controllerRays.forEach((c) => rig.add(c));
@@ -2262,11 +2234,6 @@ function pollVRControllers(session) {
     if (src.handedness === "left") {
       moveX = gp.axes[2] || 0;
       moveY = gp.axes[3] || 0;
-      // X (left, buttons[4]) — no pause menu built yet, bound directly to
-      // the one comfort setting that exists (webxr-threejs button map)
-      const xClicked = !!(gp.buttons[4] && gp.buttons[4].pressed);
-      if (xClicked && !leftXClickPrev) setComfortFade(!comfortFadeEnabled);
-      leftXClickPrev = xClicked;
     } else if (src.handedness === "right") {
       turnX = gp.axes[2] || 0;
       const clicked = !!(gp.buttons[3] && gp.buttons[3].pressed);
@@ -2345,7 +2312,7 @@ renderer.setAnimationLoop((time, frame) => {
   const dt = Math.min(0.05, clock.getDelta());
   const smooth = 1 - Math.exp(-dt / VELOCITY_SMOOTH_TIME); // frame-rate-independent damping factor
 
-  // Teleport (search-result quick-fly) / comfort-fade takes over movement
+  // Teleport (search-result quick-fly) takes over movement
   // entirely for its short duration — gates both the VR and flat movement
   // branches below rather than fighting them for rig.position.
   if (teleportAnim) {
@@ -2356,20 +2323,6 @@ renderer.setAnimationLoop((time, frame) => {
     if (raw >= 1) {
       selectNode(teleportAnim.node);
       teleportAnim = null;
-    }
-  } else if (fadeAnim) {
-    fadeAnim.t += dt;
-    fadeMesh.visible = true;
-    if (fadeAnim.phase === "out") {
-      fadeMat.opacity = Math.min(1, fadeAnim.t / 0.2);
-      if (fadeAnim.t >= 0.2) {
-        rig.position.copy(fadeAnim.target);
-        selectNode(fadeAnim.node);
-        fadeAnim.phase = "in"; fadeAnim.t = 0;
-      }
-    } else {
-      fadeMat.opacity = Math.max(0, 1 - fadeAnim.t / 0.2);
-      if (fadeAnim.t >= 0.2) { fadeAnim = null; fadeMat.opacity = 0; fadeMesh.visible = false; }
     }
   } else if (renderer.xr.isPresenting && frame) {
     const session = renderer.xr.getSession();
@@ -2623,7 +2576,7 @@ renderer.setAnimationLoop((time, frame) => {
 
 connectDataSource();
 setInterval(erlangBeat, ERLANG_INTERVAL);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, get fadeAnim() { return fadeAnim; }, get comfortFadeEnabled() { return comfortFadeEnabled; }, setComfortFade, fadeMesh, fadeMat };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; } };
 </script>
 </body>
 </html>
