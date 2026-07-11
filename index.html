@@ -60,6 +60,15 @@
     color: #cdd9ff; font-size: 11px; font-weight: 600; padding: 9px 13px; border-radius: 20px;
     cursor: pointer; backdrop-filter: blur(6px); user-select: none;
   }
+  #btn-wallet.on { background: rgba(50, 220, 140, 0.18); border-color: rgba(50, 220, 140, 0.5); color: #8affc4; }
+  #identity-chip {
+    display: none; align-items: center; gap: 8px; margin-top: 8px; pointer-events: auto;
+    background: rgba(6, 12, 10, 0.7); border: 1px solid rgba(50, 220, 140, 0.4);
+    border-radius: 22px; padding: 4px 12px 4px 4px; width: fit-content; backdrop-filter: blur(6px);
+  }
+  #identity-chip.show { display: inline-flex; }
+  #identity-keyface { width: 34px; height: 34px; border-radius: 50%; display: block; }
+  #identity-name { color: #8affc4; font-size: 12px; font-weight: 700; letter-spacing: 0.3px; }
   .pill-btn.on { border-color: #7de0ff; color: #7de0ff; background: rgba(60,120,200,0.28); }
 
   #footer-link { font-size: 10px; opacity: 0.55; pointer-events: auto; }
@@ -134,6 +143,7 @@
     <h1>WordMesh</h1>
     <div class="sub">Superhero.com word-token mesh · Phase 0</div>
     <div id="mock-badge">MOCK DATA</div>
+    <div id="identity-chip"><canvas id="identity-keyface" width="40" height="40"></canvas><span id="identity-name"></span></div>
   </div>
 
 
@@ -149,6 +159,7 @@
     <div id="left-controls">
       <button class="pill-btn on" id="btn-fly">Fly: ON</button>
       <button class="pill-btn" id="btn-freelook">Free look: OFF</button>
+      <button class="pill-btn" id="btn-wallet">Connect wallet</button>
     </div>
     <div id="footer-link">
       <a href="https://github.com/developerofwebxr-oss/wordmesh?ref=wordmesh" target="_blank" rel="noopener">wordmesh · repo</a>
@@ -2960,7 +2971,145 @@ renderer.setAnimationLoop((time, frame) => {
 
 connectDataSource();
 setInterval(erlangBeat, ERLANG_INTERVAL);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; } };
+
+/* ============================================================
+   Presence Phase A — Superhero Wallet login + self-embodiment (ZERO backend).
+   Spectator is the default: nobody has to log in to explore. Connecting a
+   wallet gives you a .chain identity and embodies you (a pill body parented to
+   the rig; the head is culled locally per webxr-threejs so it never occludes
+   the first-person camera — the full head+keyface avatar is what REMOTES will
+   see in Phase B, over a relay). Login is READ-ONLY (address + .chain name) —
+   no signing, no spend, no real-money surface in this phase.
+   ============================================================ */
+// Deterministic byte array from a string (for the keyface identicon + colour).
+function seedBytes(str, n = 16) {
+  const out = [];
+  for (let k = 0; k < n; k++) {
+    let h = (2166136261 ^ (k * 0x9e3779b1)) >>> 0;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+    out.push(h & 0xff);
+  }
+  return out;
+}
+// Keyface identicon — ported from xr-stage/identity/keyface.js (npub → AE
+// address): a 5×5 grid mirrored left↔right so it reads as a face, over a dark
+// base, accent hue from the seed. Deterministic per address.
+function drawKeyface(seed, size = 96, canvas = null) {
+  const bytes = seedBytes(seed, 16);
+  const c = canvas || document.createElement("canvas");
+  c.width = size; c.height = size;
+  const g = c.getContext("2d");
+  g.fillStyle = "#0e1119"; g.fillRect(0, 0, size, size);
+  g.fillStyle = `hsl(${Math.round((bytes[0] / 255) * 360)} 70% 62%)`;
+  const grid = 5, pad = size * 0.14, cell = (size - pad * 2) / grid;
+  for (let row = 0; row < grid; row++) {
+    for (let cx = 0; cx < 3; cx++) {
+      const i = row * 3 + cx;
+      if (!((bytes[i % bytes.length] >> (i % 8)) & 1)) continue;
+      for (const col of [cx, grid - 1 - cx]) g.fillRect(Math.floor(pad + col * cell), Math.floor(pad + row * cell), Math.ceil(cell), Math.ceil(cell));
+    }
+  }
+  return c;
+}
+// Avatar geometry — ported from xr-stage/room/avatars.js: a pill/capsule body
+// with a vertically-cut-sphere head (off-centre flat face carrying the keyface).
+const AV_HEAD_RADIUS = 0.22, AV_HEAD_CUT_DEG = 128, AV_HEAD_Y = 1.62;
+function makeAvatarHead(keyfaceCanvas) {
+  const head = new THREE.Group();
+  const cut = THREE.MathUtils.degToRad(AV_HEAD_CUT_DEG);
+  const skull = new THREE.Mesh(
+    new THREE.SphereGeometry(AV_HEAD_RADIUS, 24, 16, 0, Math.PI * 2, 0, cut),
+    new THREE.MeshStandardMaterial({ color: 0xe8e8ef, roughness: 0.6 }));
+  skull.rotation.x = Math.PI / 2; // pole → +Z (back), flat opening → -Z (forward)
+  head.add(skull);
+  const tex = new THREE.CanvasTexture(keyfaceCanvas); tex.colorSpace = THREE.SRGBColorSpace;
+  const face = new THREE.Mesh(
+    new THREE.CircleGeometry(AV_HEAD_RADIUS * Math.sin(cut), 32),
+    new THREE.MeshBasicMaterial({ map: tex }));
+  face.name = "faceMount"; face.rotation.y = Math.PI; face.position.z = AV_HEAD_RADIUS * Math.cos(cut);
+  head.add(face);
+  head.position.y = AV_HEAD_Y;
+  return head;
+}
+function makeAvatar(color, keyfaceCanvas, { withHead = true } = {}) {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.28, 0.9, 6, 12),
+    new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.28, roughness: 0.7, metalness: 0.05 }));
+  body.position.y = 0.73; // feet on y=0
+  g.add(body);
+  if (withHead) g.add(makeAvatarHead(keyfaceCanvas));
+  return g;
+}
+function avatarColorFor(address) {
+  const b = seedBytes(address, 3);
+  return new THREE.Color().setHSL(b[1] / 255, 0.62, 0.56);
+}
+// .chain name from Superhero's own API (address ↔ chain_name). Real + used now.
+async function resolveChainName(address) {
+  try {
+    const res = await withTimeout(fetch(`${SUPERHERO_API}/api/accounts/${address}`), 6000, "account");
+    if (res.ok) { const a = await res.json(); if (a && a.chain_name) return a.chain_name; }
+  } catch { /* no name / offline → fall back to short address */ }
+  return null;
+}
+// Wallet seam — MOCK now, real-shaped surface (like xr-stage/wallet/wallet.js).
+// connect() is READ-ONLY: address + .chain name. No keys held; signing/spend
+// (Phase C) will request a signature from the wallet, never hold a secret here.
+const MOCK_AE_ADDRESS = "ak_wordmeshDemoJ1qP7v9rT4kS2mN8xC5bZ3hL6dW0fY";
+const wallet = {
+  connected: false, address: null, chainName: null,
+  async connect() {
+    // REAL: connect Superhero Wallet via @aeternity/aepp-sdk — browser extension
+    // through walletDetector(new BrowserWindowMessageConnection()), or the
+    // Superhero mobile app via deeplink; then read aeSdk.address. Bundling the
+    // aepp-sdk (a heavy dep) is a deferred decision — mocked here so the flow +
+    // embodiment are testable without a wallet.
+    await new Promise((r) => setTimeout(r, 250)); // simulate the connect round-trip
+    this.address = MOCK_AE_ADDRESS;
+    this.chainName = await resolveChainName(this.address);
+    this.connected = true;
+    return { address: this.address, chainName: this.chainName };
+  },
+  disconnect() { this.connected = false; this.address = null; this.chainName = null; },
+};
+
+let localAvatar = null;
+const btnWallet = document.getElementById("btn-wallet");
+const identityChip = document.getElementById("identity-chip");
+const identityKeyface = document.getElementById("identity-keyface");
+const identityName = document.getElementById("identity-name");
+function shortAddr(a) { return a ? a.slice(0, 6) + "…" + a.slice(-4) : ""; }
+function embody() {
+  const kf = drawKeyface(wallet.address);
+  const color = avatarColorFor(wallet.address);
+  // LOCAL body only — head culled so it never blocks the first-person view
+  // (webxr-threejs). The head+keyface still renders for remotes in Phase B.
+  if (localAvatar) rig.remove(localAvatar);
+  localAvatar = makeAvatar(color, kf, { withHead: false });
+  rig.add(localAvatar);
+  // HUD identity: keyface + .chain name (or short address if no name set)
+  drawKeyface(wallet.address, 40, identityKeyface);
+  identityName.textContent = wallet.chainName ? wallet.chainName : shortAddr(wallet.address);
+  identityChip.classList.add("show");
+  btnWallet.textContent = "Disconnect";
+  btnWallet.classList.add("on");
+}
+function unembody() {
+  if (localAvatar) { rig.remove(localAvatar); localAvatar = null; }
+  identityChip.classList.remove("show");
+  btnWallet.textContent = "Connect wallet";
+  btnWallet.classList.remove("on");
+}
+btnWallet.addEventListener("click", async () => {
+  if (wallet.connected) { wallet.disconnect(); unembody(); return; }
+  btnWallet.textContent = "Connecting…"; btnWallet.disabled = true;
+  try { await wallet.connect(); embody(); }
+  catch (err) { console.warn("[WordMesh] wallet connect failed:", err.message); btnWallet.textContent = "Connect wallet"; }
+  finally { btnWallet.disabled = false; }
+});
+// Spectator is the default — nothing to do until the user connects.
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip };
 </script>
 </body>
 </html>
