@@ -1318,6 +1318,11 @@ function onXRSessionEnd() {
   scene.background = savedBackground;
   scene.fog = savedFog;
   applyFlatEyeHeight();
+  // clean up VR-only visuals so they don't linger into Screen mode
+  controllerLasers.forEach((l) => { l.visible = false; });
+  vrReticle.visible = false;
+  if (hoveredNodeIndex === vrHoverIndex) hoveredNodeIndex = -1;
+  vrHoverIndex = -1;
 }
 renderer.xr.addEventListener("sessionend", onXRSessionEnd);
 
@@ -2430,37 +2435,110 @@ resize();
    raycaster + selectFromRay() as mouse/tap — one selection path.
    ============================================================ */
 let flyClickPrev = false;
-let snapCooldown = 0;
+let leftXPrev = false;
 const controllerRays = [renderer.xr.getController(0), renderer.xr.getController(1)];
 controllerRays.forEach((c) => rig.add(c));
+// Both controllers emit a laser ray + reticle (skill: "target and select").
+// A thin line down -Z parented to the controller (so it tracks its pose) and a
+// small world-space reticle placed at the hovered node each frame.
+const _laserGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]);
+const controllerLasers = controllerRays.map((c) => {
+  const line = new THREE.Line(_laserGeo, new THREE.LineBasicMaterial({ color: 0x7de0ff, transparent: true, opacity: 0.65, depthTest: false }));
+  line.scale.z = 5; line.renderOrder = 25; line.visible = false; c.add(line);
+  return line;
+});
+const reticleGeo = new THREE.RingGeometry(0.02, 0.032, 20);
+const reticleMat = new THREE.MeshBasicMaterial({ color: 0x7de0ff, transparent: true, opacity: 0.9, depthTest: false, side: THREE.DoubleSide });
+const vrReticle = new THREE.Mesh(reticleGeo, reticleMat);
+vrReticle.visible = false; vrReticle.renderOrder = 26; scene.add(vrReticle);
+let vrHoverIndex = -1;
 const triggerPrev = [false, false];
 const _ctrlDir = new THREE.Vector3();
+const VR_STICK_DEADZONE = 0.15;
+// Read the thumbstick robustly: xr-standard puts it at axes[2]/[3], but some
+// runtimes report it at axes[0]/[1] (the touchpad slots) — take whichever pair
+// is actually deflected, so locomotion never collapses to a single axis / dead
+// stick on a device that maps them differently (the "I can only move on 1 axis"
+// report). Deadzone applied radially.
+function readStick(gp) {
+  const a = gp.axes || [];
+  let x = a[2] || 0, y = a[3] || 0;
+  if (Math.hypot(x, y) < VR_STICK_DEADZONE) { x = a[0] || 0; y = a[1] || 0; }
+  const mag = Math.hypot(x, y);
+  if (mag < VR_STICK_DEADZONE) return { x: 0, y: 0, mag: 0 };
+  return { x, y, mag };
+}
 function pollVRControllers(session) {
-  let moveX = 0, moveY = 0, turnX = 0;
+  let moveX = 0, moveY = 0, turnX = 0, sprint = false;
   for (let i = 0; i < session.inputSources.length; i++) {
     const src = session.inputSources[i];
     if (!src.gamepad) continue;
-    const gp = src.gamepad;
-    if (src.handedness === "left") {
-      moveX = gp.axes[2] || 0;
-      moveY = gp.axes[3] || 0;
-    } else if (src.handedness === "right") {
-      turnX = gp.axes[2] || 0;
+    const gp = src.gamepad, hand = src.handedness;
+    const grip = !!(gp.buttons[1] && gp.buttons[1].pressed); // grip → sprint modifier
+    if (hand === "left") {
+      const s = readStick(gp);
+      moveX = s.x; moveY = s.y;
+      if (s.mag > 0.9 || grip) sprint = true;         // analog full-push OR grip → run
+      // Left X (buttons[4]) → exit the session back to Screen (skill: app exit
+      // button; the hardware Menu button isn't exposed). Also covers Quest AR.
+      const xPressed = !!(gp.buttons[4] && gp.buttons[4].pressed);
+      if (xPressed && !leftXPrev && currentSession) currentSession.end();
+      leftXPrev = xPressed;
+    } else if (hand === "right") {
+      const s = readStick(gp);
+      turnX = Math.abs(s.x) > VR_STICK_DEADZONE ? s.x : 0; // smooth turn on X
+      if (grip) sprint = true;
+      // Right thumbstick click (buttons[3]) → toggle fly (skill standard)
       const clicked = !!(gp.buttons[3] && gp.buttons[3].pressed);
       if (clicked && !flyClickPrev) btnFly.click();
       flyClickPrev = clicked;
     }
+    // Trigger (both, buttons[0]) → laser-select, same path as mouse/tap
     const triggerPressed = !!(gp.buttons[0] && gp.buttons[0].pressed);
     if (triggerPressed && !triggerPrev[i] && i < controllerRays.length) {
-      const ctrl = controllerRays[i];
-      raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
-      _ctrlDir.set(0, 0, -1).transformDirection(ctrl.matrixWorld);
-      raycaster.ray.direction.copy(_ctrlDir);
+      setRayFromController(controllerRays[i]);
       handleSelectRay();
     }
     triggerPrev[i] = triggerPressed;
   }
-  return { moveX, moveY, turnX };
+  return { moveX, moveY, turnX, sprint };
+}
+function setRayFromController(ctrl) {
+  raycaster.ray.origin.setFromMatrixPosition(ctrl.matrixWorld);
+  _ctrlDir.set(0, 0, -1).transformDirection(ctrl.matrixWorld);
+  raycaster.ray.direction.copy(_ctrlDir);
+}
+// Per-frame: raycast both controllers at the mesh, trim each laser to its hit
+// distance, and highlight the nearest hovered node (reticle + the same
+// hoveredNodeIndex the desktop hover uses, so it gets a label). Cheap: 2 rays
+// against one InstancedMesh broad-phase.
+function updateVRHover() {
+  let best = null, bestDist = Infinity, bestCtrl = -1;
+  for (let i = 0; i < controllerRays.length; i++) {
+    setRayFromController(controllerRays[i]);
+    const hit = raycaster.intersectObject(nodeMesh)[0];
+    const laser = controllerLasers[i];
+    laser.visible = true;
+    if (hit && hit.instanceId != null && nodeData[hit.instanceId] && nodeData[hit.instanceId].alive) {
+      laser.scale.z = hit.distance;
+      if (hit.distance < bestDist) { bestDist = hit.distance; best = hit; bestCtrl = i; }
+    } else {
+      laser.scale.z = 5;
+    }
+  }
+  if (best) {
+    vrHoverIndex = best.instanceId;
+    hoveredNodeIndex = best.instanceId;         // gives the hovered node a label
+    vrReticle.visible = true;
+    vrReticle.position.copy(best.point);
+    vrReticle.quaternion.copy(camera.quaternion); // face the viewer
+    controllerLasers[bestCtrl].material.color.setHex(0x32dc8c); // green on a target
+  } else {
+    if (vrHoverIndex >= 0 && hoveredNodeIndex === vrHoverIndex) hoveredNodeIndex = -1;
+    vrHoverIndex = -1;
+    vrReticle.visible = false;
+    controllerLasers.forEach((l) => l.material.color.setHex(0x7de0ff));
+  }
 }
 
 /* ============================================================
@@ -2576,6 +2654,7 @@ const MOVE_SPEED = 5.0;
 const SPRINT_SPEED = 11.0;
 const VR_MOVE_SPEED = 3.6;   // gentler in-headset per XR comfort norms
 const VR_SPRINT_SPEED = 7.5;
+const VR_TURN_SPEED = 2.4;   // rad/s at full right-stick deflection (smooth turn, skill default)
 const STICK_DEADZONE = 0.12;
 const VELOCITY_SMOOTH_TIME = 0.15; // seconds; lower = snappier, higher = floatier
 const SELECTED_FLARE_LEVEL = 0.5; // sustained node highlight while its panel is open
@@ -2603,12 +2682,10 @@ renderer.setAnimationLoop((time, frame) => {
     }
   } else if (renderer.xr.isPresenting && frame) {
     const session = renderer.xr.getSession();
-    const { moveX, moveY, turnX } = pollVRControllers(session);
-    snapCooldown -= dt;
-    if (Math.abs(turnX) > 0.65 && snapCooldown <= 0) {
-      rig.rotation.y -= Math.sign(turnX) * (Math.PI / 6); // 30° snap-turn
-      snapCooldown = 0.35;
-    }
+    const { moveX, moveY, turnX, sprint } = pollVRControllers(session);
+    updateVRHover(); // laser + reticle + hovered-node highlight
+    // smooth continuous turn (skill default; snap is an opt-in we don't force)
+    if (turnX) rig.rotation.y -= turnX * VR_TURN_SPEED * dt;
     camera.getWorldDirection(_fwd);
     if (!flyMode) _fwd.y = 0;
     _fwd.normalize();
@@ -2633,7 +2710,7 @@ renderer.setAnimationLoop((time, frame) => {
     if (mlen > 1) { mx /= mlen; my /= mlen; }
     let vy = 0;
     if (flyMode) vy = Math.max(-1, Math.min(1, mobileVertical));
-    const speed = (mlen > 0.85 || jmag > 0.9) ? VR_SPRINT_SPEED : VR_MOVE_SPEED;
+    const speed = (sprint || mlen > 0.85 || jmag > 0.9) ? VR_SPRINT_SPEED : VR_MOVE_SPEED;
     _targetVel.set(0, 0, 0).addScaledVector(_fwd, my * speed).addScaledVector(_right, mx * speed);
     _targetVel.y += vy * speed;
     velocity.lerp(_targetVel, smooth);
@@ -2883,7 +2960,7 @@ renderer.setAnimationLoop((time, frame) => {
 
 connectDataSource();
 setInterval(erlangBeat, ERLANG_INTERVAL);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; } };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; } };
 </script>
 </body>
 </html>
