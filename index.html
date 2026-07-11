@@ -99,6 +99,16 @@
     padding-top: calc(10px + env(safe-area-inset-top)); backdrop-filter: blur(6px);
   }
   #btn-exit-xr.show { display: block; }
+  #wallet-help {
+    position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%);
+    width: min(92vw, 360px); z-index: 13; display: none; pointer-events: auto;
+    background: rgba(6,12,10,0.92); border: 1px solid rgba(50,220,140,0.5); border-radius: 14px;
+    padding: 14px 16px; color: #eaffe8; font-size: 13px; line-height: 1.4; backdrop-filter: blur(8px);
+  }
+  #wallet-help.show { display: block; }
+  #wallet-help b { color: #8affc4; }
+  #wallet-help-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  #wallet-help-actions .pill-btn { flex: 1; text-align: center; min-width: 92px; }
 
   #joystick-wrap {
     position: fixed; left: 20px; bottom: 20px; width: 110px; height: 110px;
@@ -171,6 +181,14 @@
 <div id="joystick-wrap"><div id="joystick-base"></div><div id="joystick-nub"></div></div>
 <div id="vert-wrap"><button class="vert-btn" id="btn-up">&#9650;</button><button class="vert-btn" id="btn-down">&#9660;</button></div>
 <button id="btn-exit-xr">Exit AR</button>
+<div id="wallet-help">
+  <div id="wallet-help-text">On mobile, connect inside the <b>Superhero Wallet app</b>: open the app → its <b>Browser</b> tab → open this page. A normal mobile browser can't reach the wallet.</div>
+  <div id="wallet-help-actions">
+    <button class="pill-btn" id="wh-open">Open Superhero app</button>
+    <button class="pill-btn" id="wh-copy">Copy link</button>
+    <button class="pill-btn" id="wh-close">Dismiss</button>
+  </div>
+</div>
 
 <script type="importmap">
 {
@@ -3183,7 +3201,22 @@ btnWallet.addEventListener("click", async () => {
     const lbl = WALLET_ERR_LABEL[err.code];
     btnWallet.textContent = (typeof lbl === "function" ? lbl() : lbl) || "Connect failed (see console)";
     setTimeout(() => { if (!wallet.connected) btnWallet.textContent = "Connect Superhero Wallet"; }, 6000);
+    // Mobile can't reach the wallet from a normal browser — show how to connect
+    // via the Superhero app's in-app browser (the only path that works there).
+    if (err.code === "no-wallet" && isCoarsePointer) walletHelp.classList.add("show");
   } finally { btnWallet.disabled = false; }
+});
+// Mobile wallet help panel (Superhero app in-app browser is the only mobile
+// path; superhero:// best-effort launches the app so the user can open its
+// Browser). `superhero://` is the wallet's registered scheme (MOBILE_SCHEMA).
+const walletHelp = document.getElementById("wallet-help");
+document.getElementById("wh-close").addEventListener("click", () => walletHelp.classList.remove("show"));
+document.getElementById("wh-open").addEventListener("click", () => { try { location.href = "superhero://"; } catch {} });
+document.getElementById("wh-copy").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  try { await navigator.clipboard.writeText(location.href); btn.textContent = "Copied!"; }
+  catch { btn.textContent = location.href.slice(0, 24) + "…"; }
+  setTimeout(() => { btn.textContent = "Copy link"; }, 2500);
 });
 // Spectator is the default — nothing to do until the user connects.
 
