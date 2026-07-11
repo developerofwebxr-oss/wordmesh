@@ -370,11 +370,16 @@ class SuperheroSource {
       const saleAddr = payload.sale_address || payload.token?.sale_address;
       const word = this.bySaleAddr.get(saleAddr) || (payload.token ? wordFromToken(payload.token) : null);
       if (!word) return;
+      // live post-trade market cap (raw big-int / 10^decimals, like _mapToken)
+      // drives node growth/shrink; amount.ae gates the loud-buy toast
+      const decimals = Number(payload.token?.decimals) || 18;
+      const marketCap = (parseFloat(payload.market_cap ?? payload.token?.market_cap) || 0) / 10 ** decimals;
       cb({
         type: payload.tx_type,
         word,
         saleAddress: saleAddr,
-        amount: parseFloat(payload.amount?.ae ?? payload.amount) || 1,
+        amount: parseFloat(payload.amount?.ae ?? payload.amount) || 0,
+        marketCap,
         ts: Date.now(),
       });
     });
@@ -719,6 +724,23 @@ function liveNormScale(v, range, lo, hi) {
   const t = (Math.log10(1 + Math.max(0, v)) - range.min) / (range.max - range.min);
   return lo + Math.max(0, Math.min(1, t)) * (hi - lo);
 }
+// Node radius follows LIVE market cap so a token grows as people buy and shrinks
+// as they sell (a living organism). Same log-normalisation as the build size
+// (identical for a node at its build market cap), but the interpolant is NOT
+// clamped to [0,1] — so a token that grows past the snapshot's top keeps growing
+// and one that's sold down keeps shrinking — then hard-capped to [MIN,MAX] so a
+// runaway node never overlaps its neighbours (spawn-shell spacing is fixed at
+// creation) or shrinks to nothing. Size is decoupled from identity: it only ever
+// changes n.scale, never n.index/n.pos, so positional identity is untouched.
+const MIN_NODE_SCALE = 0.18, MAX_NODE_SCALE = 3.5;
+function liveScaleForMc(mc) {
+  if (!liveSizeRange || liveSizeRange.max <= liveSizeRange.min) return 1;
+  const t = (Math.log10(1 + Math.max(0, mc)) - liveSizeRange.min) / (liveSizeRange.max - liveSizeRange.min);
+  return Math.max(MIN_NODE_SCALE, Math.min(MAX_NODE_SCALE, 0.35 + t * 1.6));
+}
+const SCALE_LERP_TIME = 0.4;  // seconds a grow/shrink eases over
+const BUY_LOUD_AE = 10;        // buys >= this get the big spark + billboard toast
+const FLARE_MAX = 2.6;         // rapid same-token buys escalate the flare up to here
 
 // The 14-60 spawn-radius shell below was tuned for MockSource's 220 nodes.
 // The real token universe is much smaller (~51), so filling the same shell
@@ -788,13 +810,13 @@ function buildNodesFromSnapshot(snap) {
     const baseColor = new THREE.Color().setHSL(hue, 0.75, 0.55);
     const sizeMetric = tok.marketCap != null ? tok.marketCap : tok.price;
     const scale = dataMode === "live"
-      ? liveNormScale(sizeMetric, liveSizeRange, 0.35, 1.95)
+      ? liveScaleForMc(sizeMetric)
       : priceToScale(sizeMetric);
     const intensity = dataMode === "live"
       ? liveNormScale(tok.volume24h, liveVolRange, 0.6, 3.0)
       : volumeToIntensity(tok.volume24h);
     const entry = {
-      word, index: i, alive: true,
+      word, index: i, alive: true, targetScale: scale, // live size eases toward targetScale
       // shown everywhere a human reads the token; only differs from `word`
       // when two tokens share a symbol, so identical words never appear twice
       displayName: wordCounts.get(word) > 1 && tok.saleAddress
@@ -871,7 +893,7 @@ function addLiveToken(tok) {
   );
   const baseColor = new THREE.Color().setHSL(hueForWord(i), 0.75, 0.55);
   const sizeMetric = tok.marketCap != null ? tok.marketCap : tok.price;
-  const scale = liveSizeRange ? liveNormScale(sizeMetric, liveSizeRange, 0.35, 1.95) : 1;
+  const scale = liveSizeRange ? liveScaleForMc(sizeMetric) : 1;
   const intensity = liveVolRange ? liveNormScale(tok.volume24h, liveVolRange, 0.6, 3.0) : 1.5;
   const displayName = nodeData.some((n) => n.word === tok.word)
     ? `${tok.word}·${tok.saleAddress.slice(3, 7)}` : tok.word;
@@ -879,7 +901,7 @@ function addLiveToken(tok) {
   const entry = {
     word: tok.word, index: i, alive: true, displayName,
     price: tok.price, volume24h: tok.volume24h, marketCap: tok.marketCap, saleAddress: tok.saleAddress,
-    pos, baseColor, scale, intensity,
+    pos, baseColor, scale, intensity, targetScale: scale, // live size eases toward targetScale
     flare: 1.0,          // initial event flare
     birth: 1,            // drives the map-wide birth flash, decays over BIRTH_DURATION
     dying: false, dieT: 0, spawnT: 1, // full size at once — the birth flash is the drama
@@ -1114,10 +1136,25 @@ function nodeForEvent(word, saleAddress) {
   if (bySale && bySale.alive) return bySale;
   return nodeData.find((d) => d.word === word && d.alive) || null;
 }
-function flareNode(word, type, saleAddress) {
+function flareNode(word, type, saleAddress, marketCap, amount) {
   const n = nodeForEvent(word, saleAddress);
   if (!n) return;
-  n.flare = type === "sell" ? 0.35 : 0.9;
+  // Rapid same-token trades ESCALATE the flare (add, capped) rather than
+  // resetting it — a burst reads as one building event, not a strobe.
+  n.flare = Math.min(FLARE_MAX, n.flare + (type === "sell" ? 0.35 : 0.9));
+  // Live size follows real market cap: grow on buys, shrink on sells. Only
+  // n.targetScale moves here (the per-frame lerp eases n.scale toward it and
+  // refreshes pick bounds); index/pos are never touched, so identity holds.
+  if (marketCap > 0 && liveSizeRange) {
+    n.marketCap = marketCap;
+    n.targetScale = liveScaleForMc(marketCap);
+  }
+  // Loud buys (>= BUY_LOUD_AE) get a big spark + a billboard toast at the node;
+  // small buys and all sells stay quiet (just the pulse + grow/shrink).
+  if (type === "buy" && (amount || 0) >= BUY_LOUD_AE) {
+    n.flare = Math.min(FLARE_MAX, n.flare + 0.8); // extra spark for a loud buy
+    spawnBuyToast(n, amount);
+  }
   const fromIdx = edgeTowardNode(n.index);
   if (fromIdx !== null) spawnPulse(fromIdx, n.index, n.baseColor.clone().lerp(new THREE.Color(0xffffff), 0.4), false);
   // A live trade flares the node in 3D only. It must NOT write any readout:
@@ -1128,7 +1165,7 @@ function flareNode(word, type, saleAddress) {
 }
 
 function onDataEvent(evt) {
-  if (evt.type === "buy" || evt.type === "sell") flareNode(evt.word, evt.type, evt.saleAddress);
+  if (evt.type === "buy" || evt.type === "sell") flareNode(evt.word, evt.type, evt.saleAddress, evt.marketCap, evt.amount);
 }
 source.subscribe(onDataEvent);
 
@@ -1197,12 +1234,13 @@ function reviveSlot(n) {
   }
   const sizeMetric = n.marketCap != null ? n.marketCap : n.price;
   if (dataMode === "live") {
-    n.scale = liveNormScale(sizeMetric, liveSizeRange, 0.35, 1.95);
+    n.scale = liveScaleForMc(sizeMetric);
     n.intensity = liveNormScale(n.volume24h, liveVolRange, 0.6, 3.0);
   } else {
     n.scale = priceToScale(sizeMetric);
     n.intensity = volumeToIntensity(n.volume24h);
   }
+  n.targetScale = n.scale; // reset the live-size target on respawn
   const r = (14 + Math.random() * 46) * spawnDensityScale;
   const theta = Math.random() * Math.PI * 2;
   const phi = Math.acos(2 * Math.random() - 1);
@@ -2469,6 +2507,68 @@ const clock = new THREE.Clock();
 let edgeRebuildAccum = 0;
 let lastHoverCheck = 0;
 
+/* ============================================================
+   Buy toast — an in-world billboard above a node on a loud buy ("+70 AE ▲
+   SYMBOL"), floats up and fades. In-world (added to the scene at the node) so
+   it reads in VR/AR too, not just as a flat overlay. Idle-free: updateBuyToasts
+   early-returns when none are active. Fixed-size canvas (no per-repaint resize),
+   so it never hits the CanvasTexture resize-upload bug. Rapid buys on the SAME
+   node COALESCE: the live toast's amount accumulates and its life resets rather
+   than stacking a second sprite (pairs with the escalating flare in flareNode).
+   ============================================================ */
+const TOAST_LIFE = 1.7, TOAST_RISE = 1.3;
+const _activeToasts = [];              // { sprite, node, t, amount }
+const _toastByNode = new Map();        // node.index -> active toast (for coalescing)
+function paintBuyToast(toast) {
+  const cnv = toast.sprite.userData.cnv, ctx = cnv.getContext("2d");
+  const W = cnv.width, H = cnv.height, dpr = Math.min(window.devicePixelRatio || 1, 2);
+  ctx.clearRect(0, 0, W, H);
+  const label = `+${Math.round(toast.amount)} AE  ▲  ${toast.node.displayName}`;
+  ctx.font = `700 ${26 * dpr}px -apple-system, sans-serif`;
+  const tw = ctx.measureText(label).width, padX = 22 * dpr, padY = 12 * dpr;
+  const bw = Math.min(W - 4, tw + padX * 2), bh = 46 * dpr, bx = (W - bw) / 2, by = (H - bh) / 2;
+  ctx.fillStyle = "rgba(6,12,10,0.82)";
+  ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, bh / 2); ctx.fill();
+  ctx.strokeStyle = "#32dc8c"; ctx.lineWidth = 2.5 * dpr;
+  ctx.beginPath(); ctx.roundRect(bx + 1, by + 1, bw - 2, bh - 2, bh / 2); ctx.stroke();
+  ctx.fillStyle = "#8affc4"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.shadowColor = "#32dc8c"; ctx.shadowBlur = 8 * dpr;
+  ctx.fillText(label, W / 2, H / 2 + 1); ctx.shadowBlur = 0;
+  toast.sprite.userData.tex.needsUpdate = true;
+}
+function spawnBuyToast(node, amountAe) {
+  const existing = _toastByNode.get(node.index);
+  if (existing) { existing.amount += amountAe; existing.t = 0; paintBuyToast(existing); return; } // coalesce
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cnv = document.createElement("canvas");
+  cnv.width = 512 * dpr; cnv.height = 96 * dpr; // fixed size — never resized
+  const tex = new THREE.CanvasTexture(cnv); tex.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false }));
+  sprite.userData = { cnv, tex };
+  sprite.renderOrder = 30;
+  sprite.scale.set(4.2, 0.79, 1); // world size (aspect matches the canvas)
+  scene.add(sprite);
+  const toast = { sprite, node, t: 0, amount: amountAe };
+  paintBuyToast(toast);
+  _activeToasts.push(toast); _toastByNode.set(node.index, toast);
+}
+function updateBuyToasts(dt) {
+  if (!_activeToasts.length) return;
+  for (let i = _activeToasts.length - 1; i >= 0; i--) {
+    const T = _activeToasts[i]; T.t += dt;
+    const k = T.t / TOAST_LIFE;
+    if (k >= 1) {
+      scene.remove(T.sprite); T.sprite.material.map.dispose(); T.sprite.material.dispose();
+      _activeToasts.splice(i, 1); _toastByNode.delete(T.node.index);
+      continue;
+    }
+    const nodeR = T.node.scale * 0.55;
+    T.sprite.position.copy(T.node.pos);
+    T.sprite.position.y += nodeR * 1.2 + 0.7 + k * TOAST_RISE;
+    T.sprite.material.opacity = k < 0.12 ? k / 0.12 : 1 - (k - 0.12) / 0.88; // quick in, slow fade
+  }
+}
+
 // Tuned for "glide through a constellation": fast enough to cross the ~120-unit
 // field in well under a minute, smoothed so input reads as momentum rather than
 // an instant on/off snap.
@@ -2587,9 +2687,16 @@ renderer.setAnimationLoop((time, frame) => {
   }
 
   // node flare decay + spawn/despawn animation
+  let scaleLerpActive = false;
   for (const n of nodeData) {
     if (n.flare > 0) n.flare = Math.max(0, n.flare - dt * 1.6);
     if (n.birth > 0) n.birth = Math.max(0, n.birth - dt / BIRTH_DURATION);
+    // ease live size toward its market-cap target (grow on buys / shrink on sells)
+    if (n.targetScale != null && n.scale !== n.targetScale) {
+      n.scale += (n.targetScale - n.scale) * (1 - Math.exp(-dt / SCALE_LERP_TIME));
+      if (Math.abs(n.scale - n.targetScale) < 1e-3) n.scale = n.targetScale;
+      else scaleLerpActive = true;
+    }
     // panel selection highlight: brightness/shine only, via the existing
     // flare mechanic (which only ever scales baseColor, never re-hues it)
     // — never a colour change, per the task's explicit guardrail
@@ -2631,6 +2738,11 @@ renderer.setAnimationLoop((time, frame) => {
   farGeo.attributes.color.needsUpdate = true;
 
   refreshInstances();
+  // a node that just grew/shrank changed its extent — keep the pick broad-phase
+  // sphere honest so taps stay accurate at the new size (cheap at ~60 nodes,
+  // and only while a size ease is in flight)
+  if (scaleLerpActive) refreshNodeBounds();
+  updateBuyToasts(dt);
 
   // pulses
   let pulseInstanceCount = 0;
@@ -2771,7 +2883,7 @@ renderer.setAnimationLoop((time, frame) => {
 
 connectDataSource();
 setInterval(erlangBeat, ERLANG_INTERVAL);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; } };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; } };
 </script>
 </body>
 </html>
