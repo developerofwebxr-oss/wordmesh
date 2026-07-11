@@ -3140,6 +3140,9 @@ const identityChip = document.getElementById("identity-chip");
 const identityKeyface = document.getElementById("identity-keyface");
 const identityName = document.getElementById("identity-name");
 function shortAddr(a) { return a ? a.slice(0, 6) + "…" + a.slice(-4) : ""; }
+// Truncate a very long .chain name for display (chip + avatar labels); the full
+// name still travels over the wire, only the render is shortened.
+function shortName(s, max = 18) { return s && s.length > max ? s.slice(0, max - 1) + "…" : (s || ""); }
 function embody() {
   const kf = drawKeyface(wallet.address);
   const color = avatarColorFor(wallet.address);
@@ -3150,7 +3153,7 @@ function embody() {
   rig.add(localAvatar);
   // HUD identity: keyface + .chain name (or short address if no name set)
   drawKeyface(wallet.address, 40, identityKeyface);
-  identityName.textContent = wallet.chainName ? wallet.chainName : shortAddr(wallet.address);
+  identityName.textContent = wallet.chainName ? shortName(wallet.chainName) : shortAddr(wallet.address);
   identityChip.classList.add("show");
   btnWallet.textContent = "Disconnect";
   btnWallet.classList.add("on");
@@ -3213,7 +3216,8 @@ function getLocalPose() {
 }
 const _round3 = (n) => Math.round(n * 1000) / 1000;
 
-function paintNameLabel(cnv, text) {
+function paintNameLabel(cnv, rawText) {
+  const text = shortName(rawText, 20); // truncate long .chain names on the 3D label
   const ctx = cnv.getContext("2d"), W = cnv.width, H = cnv.height;
   ctx.clearRect(0, 0, W, H);
   ctx.font = "700 30px -apple-system, sans-serif";
@@ -3283,7 +3287,7 @@ function updatePresence(dt) {
   }
 }
 connectRelay();
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip, get remoteCount() { return remoteAvatars.size; }, get remoteAvatars() { return remoteAvatars; }, RELAY_URL, get relayReady() { return !!relaySocket && relaySocket.readyState === 1; } };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, shortName, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip, get remoteCount() { return remoteAvatars.size; }, get remoteAvatars() { return remoteAvatars; }, RELAY_URL, get relayReady() { return !!relaySocket && relaySocket.readyState === 1; } };
 </script>
 </body>
 </html>
