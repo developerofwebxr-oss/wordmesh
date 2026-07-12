@@ -3154,13 +3154,18 @@ function buildConnectDeeplink() {
 // transaction=tx_…&broadcast=true&x-success=<cb {transaction-hash}>&x-cancel=<cb>.
 // The wallet substitutes {transaction-hash} after decoding x-success (same as it
 // does {address} for connect), so the placeholder is encoded here just like that.
+// The mainnet networkId, matching the AE_MAINNET node our unsigned tx is built
+// against. /sign-transaction REQUIRES networkId (per the wallet's deep-link
+// schema); omitting it makes the app reject the sign with "network discrepancy".
+const AE_MAINNET_NETWORK_ID = "ae_mainnet";
 function buildTipDeeplink(unsignedTx) {
   const success = encodeURIComponent(walletCbBase() + "?wcb=tip&th={transaction-hash}");
   const cancel = encodeURIComponent(walletCbBase() + "?wcb=tipcancel");
-  return `${SUPERHERO_APP}/sign-transaction?transaction=${encodeURIComponent(unsignedTx)}&broadcast=true&x-success=${success}&x-cancel=${cancel}`;
+  const nid = wallet.networkId || AE_MAINNET_NETWORK_ID;
+  return `${SUPERHERO_APP}/sign-transaction?transaction=${encodeURIComponent(unsignedTx)}&networkId=${encodeURIComponent(nid)}&broadcast=true&x-success=${success}&x-cancel=${cancel}`;
 }
 const wallet = {
-  connected: false, address: null, chainName: null, _sdk: null,
+  connected: false, address: null, chainName: null, _sdk: null, networkId: null,
   async connect(onStage) {
     const stage = (s) => { console.info("[SuperheroWallet]", s); onStage && onStage(s); };
     if (new URLSearchParams(location.search).get("mockwallet") === "1") {
@@ -3322,6 +3327,7 @@ document.getElementById("wh-copy").addEventListener("click", async (e) => {
   const q = new URLSearchParams(location.search);
   if (q.get("wcb") === "addr" && /^ak_/.test(q.get("address") || "")) {
     wallet.address = q.get("address");
+    wallet.networkId = q.get("networkId") || null; // the wallet's active network — reused for the sign deeplink so it can't mismatch
     wallet.chainName = await resolveChainName(wallet.address);
     wallet.connected = true;
     sessionStorage.removeItem("wm_wallet_pending");
