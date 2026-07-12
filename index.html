@@ -1401,6 +1401,17 @@ btnExitXR.addEventListener("click", () => { if (currentSession) currentSession.e
 // fallback for touch devices that under-report it. Desktop (0 touch points,
 // fine-only) stays false, so mouse-fly / WASD is unchanged.
 const isCoarsePointer = (navigator.maxTouchPoints || 0) > 0 || matchMedia("(pointer: coarse)").matches;
+// A true phone/tablet — where NO Superhero browser extension can exist, so the
+// only way to reach the wallet is the Superhero APP via the universal-link
+// deeplink. Distinct from isCoarsePointer, which is ALSO true on touchscreen
+// laptops (those DO have the extension and must use it). iPadOS ≥13 Safari
+// reports a desktop UA, so detect it via MacIntel + touch. This gate decides
+// the connect route: mobile → synchronous deeplink (iOS only opens the app when
+// the navigation happens inside the click gesture); desktop/touch-laptop →
+// extension detector.
+const _ua = navigator.userAgent || "";
+const isMobileDevice = /iPhone|iPad|iPod|Android/i.test(_ua) ||
+  (navigator.platform === "MacIntel" && (navigator.maxTouchPoints || 0) > 1);
 let flyMode = true;
 const btnFly = document.getElementById("btn-fly");
 btnFly.addEventListener("click", () => {
@@ -3144,6 +3155,19 @@ const wallet = {
     if (new URLSearchParams(location.search).get("mockwallet") === "1") {
       await new Promise((r) => setTimeout(r, 200));
       this.address = MOCK_AE_ADDRESS;
+    } else if (isMobileDevice) {
+      // Real phone/tablet: no browser extension exists here, so hand off to the
+      // Superhero APP. This navigation MUST be synchronous within the click
+      // gesture — iOS only opens the app for a universal link when the
+      // navigation is user-initiated; deferring it behind an async extension
+      // probe (as the desktop path does) makes iOS open wallet.superhero.com in
+      // the browser instead of the app. handleWalletCallback() resumes on
+      // return with ?wcb=addr&address=… . (Android is lenient about the timing,
+      // but synchronous is correct for it too.)
+      stage("opening Superhero Wallet app");
+      sessionStorage.setItem("wm_wallet_pending", "1");
+      location.href = buildConnectDeeplink();
+      return await new Promise(() => {}); // page unloads into the app
     } else {
       stage("loading SDK");
       let sdk;
@@ -3524,7 +3548,7 @@ function showTipToast(text) {
 }
 tipPromptSend.addEventListener("click", confirmTip);
 tipPromptCancel.addEventListener("click", closeTipPrompt);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, shortName, buildConnectDeeplink, __testSetRelay: (o) => { relaySocket = o; }, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip, get remoteCount() { return remoteAvatars.size; }, get remoteAvatars() { return remoteAvatars; }, RELAY_URL, get relayReady() { return !!relaySocket && relaySocket.readyState === 1; }, openTipPrompt, confirmTip, get tipBeamCount() { return _tipBeams.length; }, get tipToast() { return { text: tipToast.textContent, shown: tipToast.classList.contains("show") }; }, TIP_AMOUNT_AE };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, shortName, buildConnectDeeplink, __testSetRelay: (o) => { relaySocket = o; }, get isMobileDevice() { return isMobileDevice; }, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip, get remoteCount() { return remoteAvatars.size; }, get remoteAvatars() { return remoteAvatars; }, RELAY_URL, get relayReady() { return !!relaySocket && relaySocket.readyState === 1; }, openTipPrompt, confirmTip, get tipBeamCount() { return _tipBeams.length; }, get tipToast() { return { text: tipToast.textContent, shown: tipToast.classList.contains("show") }; }, TIP_AMOUNT_AE };
 </script>
 </body>
 </html>
