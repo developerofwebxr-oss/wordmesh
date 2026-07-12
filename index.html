@@ -3144,14 +3144,6 @@ const wallet = {
     if (new URLSearchParams(location.search).get("mockwallet") === "1") {
       await new Promise((r) => setTimeout(r, 200));
       this.address = MOCK_AE_ADDRESS;
-    } else if (isCoarsePointer) {
-      // MOBILE: hand off to the Superhero app via its universal link. The page
-      // navigates away and returns via the ?wcb=addr callback (handled on load),
-      // so this promise intentionally never resolves here.
-      stage("opening Superhero Wallet app");
-      sessionStorage.setItem("wm_wallet_pending", "1");
-      location.href = buildConnectDeeplink();
-      return await new Promise(() => {});
     } else {
       stage("loading SDK");
       let sdk;
@@ -3165,37 +3157,51 @@ const wallet = {
         onAddressChange: () => {},
         onDisconnect: () => { try { this.disconnect(); unembody(); } catch {} },
       });
-      // Scan for the SUPERHERO wallet only (extension postMessage bridge, or the
-      // Superhero mobile app's in-app browser). The detector callback gives
-      // `newWallet` only for a freshly-announced wallet; if Superhero announced
-      // before we started scanning it's in `wallets` instead — handle both, or
-      // the connect silently never fires. Staged so a failed connect reports
-      // exactly WHERE it broke.
-      this.address = await new Promise((resolve, reject) => {
-        let stop, done = false;
-        const fail = (code, msg, cause) => { if (done) return; done = true; try { stop && stop(); } catch {} const e = new Error(msg); e.code = code; if (cause) e.cause = cause; reject(e); };
-        const timer = setTimeout(() => fail("no-wallet", "No Superhero Wallet detected — install the extension, or open this page inside the Superhero app browser."), 8000);
-        const handle = async ({ wallets, newWallet }) => {
-          const wlt = newWallet || Object.values(wallets || {})[0];
-          if (!wlt) return; // nothing yet — keep scanning
-          const name = wlt.info?.name || "";
-          if (!/superhero/i.test(name)) { console.info("[SuperheroWallet] ignoring non-Superhero wallet:", name); return; } // Superhero-only
-          if (done) return; done = true; clearTimeout(timer); try { stop(); } catch {}
-          try {
-            stage("connecting to " + name);
-            await aeSdk.connectToWallet(wlt.getConnection());
-            stage("requesting address (approve in the wallet)");
-            const sub = await aeSdk.subscribeAddress("subscribe", "connected");
-            const addr = Object.keys(sub.address && sub.address.current || {})[0];
-            if (!addr) throw new Error("wallet returned no address (connection not approved?)");
-            resolve(addr);
-          } catch (e) { const err = new Error("Connection rejected or failed: " + (e && e.message || e)); err.code = "connect-failed"; err.cause = e; reject(err); }
-        };
-        stage("scanning for Superhero Wallet");
-        try { stop = walletDetector(new BrowserWindowMessageConnection(), handle); }
-        catch (e) { fail("detector", "wallet detector failed to start", e); }
-      });
-      this._sdk = aeSdk;
+      // Try the SUPERHERO extension FIRST on EVERY device — a touchscreen laptop
+      // has the extension too, so it must NOT be routed to the mobile deeplink
+      // (that path gives an address but no live signer, so a tip could never be
+      // signed — a likely cause of "it didn't ask the wallet to sign"). Only if
+      // no extension answers AND we're on a touch device do we hand off to the
+      // Superhero APP via the deeplink. The detector callback gives `newWallet`
+      // only for a freshly-announced wallet; if Superhero announced before we
+      // scanned it's in `wallets` — handle both or the connect silently never
+      // fires.
+      try {
+        this.address = await new Promise((resolve, reject) => {
+          let stop, done = false;
+          const fail = (code, msg, cause) => { if (done) return; done = true; try { stop && stop(); } catch {} const e = new Error(msg); e.code = code; if (cause) e.cause = cause; reject(e); };
+          const timer = setTimeout(() => fail("no-wallet", "No Superhero extension detected."), 4500);
+          const handle = async ({ wallets, newWallet }) => {
+            const wlt = newWallet || Object.values(wallets || {})[0];
+            if (!wlt) return; // nothing yet — keep scanning
+            const name = wlt.info?.name || "";
+            if (!/superhero/i.test(name)) { console.info("[SuperheroWallet] ignoring non-Superhero wallet:", name); return; } // Superhero-only
+            if (done) return; done = true; clearTimeout(timer); try { stop(); } catch {}
+            try {
+              stage("connecting to " + name);
+              await aeSdk.connectToWallet(wlt.getConnection());
+              stage("requesting address (approve in the wallet)");
+              const sub = await aeSdk.subscribeAddress("subscribe", "connected");
+              const addr = Object.keys(sub.address && sub.address.current || {})[0];
+              if (!addr) throw new Error("wallet returned no address (connection not approved?)");
+              resolve(addr);
+            } catch (e) { const err = new Error("Connection rejected or failed: " + (e && e.message || e)); err.code = "connect-failed"; err.cause = e; reject(err); }
+          };
+          stage("scanning for Superhero Wallet");
+          try { stop = walletDetector(new BrowserWindowMessageConnection(), handle); }
+          catch (e) { fail("detector", "wallet detector failed to start", e); }
+        });
+        this._sdk = aeSdk; // a real, connected signer — required to sign tips
+      } catch (e) {
+        // no extension → on a touch device hand off to the Superhero APP
+        if (e.code === "no-wallet" && isCoarsePointer) {
+          stage("opening Superhero Wallet app");
+          sessionStorage.setItem("wm_wallet_pending", "1");
+          location.href = buildConnectDeeplink();
+          return await new Promise(() => {});
+        }
+        throw e; // desktop with no extension, or a real connection error
+      }
     }
     stage("resolving .chain name");
     this.chainName = await resolveChainName(this.address);
@@ -3444,27 +3450,41 @@ function closeTipPrompt() { tipPrompt.classList.remove("show"); tipPrompt._targe
 async function confirmTip() {
   const target = tipPrompt._target; closeTipPrompt();
   if (!target || !wallet.connected) return;
-  // Mobile connects via deeplink (no live SDK to sign with) — tip-SENDING over
-  // the /sign-transaction deeplink is a follow-up; be honest rather than fail.
-  if (!wallet._sdk && new URLSearchParams(location.search).get("mockwallet") !== "1") {
-    showTipToast("Sending tips is desktop-only for now"); return;
-  }
-  showTipToast("Signing " + TIP_AMOUNT_AE + " AE…");
+  const isMock = new URLSearchParams(location.search).get("mockwallet") === "1";
+  // Mobile deeplink connect has no live SDK to sign with; the extension connect
+  // does. Without one, NOTHING is sent — never a beam without a real tx.
+  if (!isMock && !wallet._sdk) { showTipToast("Reconnect your wallet to tip (no signer)"); return; }
+
+  // NOTHING visual happens until the wallet has actually signed + broadcast a
+  // real transaction. This gate is the whole point: a tip beam with no tx behind
+  // it would be a fabricated event (worse, one broadcast onto other people's
+  // screens). We require a real `th_…` hash back before anything.
+  showTipToast("Waiting for wallet to sign…");
+  let txHash = null;
   try {
-    let txHash;
-    if (new URLSearchParams(location.search).get("mockwallet") === "1") {
-      await new Promise((r) => setTimeout(r, 300)); txHash = "th_mock" + Date.now().toString(36);
+    if (isMock) {
+      await new Promise((r) => setTimeout(r, 300)); txHash = "th_MOCK_local_only";
     } else {
-      // REAL mainnet 10 AE spend — the wallet prompts the user to sign. Explicit,
-      // one-off, never automatic.
+      // REAL mainnet 10 AE spend — the Superhero popup MUST appear and the user
+      // approve. spend() builds → signs (via the wallet) → broadcasts, resolving
+      // with the on-chain tx. If no real th_ hash comes back, it did NOT happen.
       const res = await wallet._sdk.spend(TIP_AMOUNT_AE, target.seed, { denomination: "ae" });
-      txHash = (res && (res.hash || (res.tx && res.tx.hash))) || "";
+      txHash = (res && (res.hash || res.txHash || (res.tx && res.tx.hash))) || null;
+      if (!/^th_/.test(txHash || "")) throw new Error("no signed transaction hash returned");
     }
-    fireTipBeam(myBodyPos(), avatarBodyPos(target.group));
-    showTipToast("Sent " + TIP_AMOUNT_AE + " AE to " + shortName(target.name, 16) + " ✓");
-    if (relaySocket && relaySocket.readyState === 1)
-      relaySocket.send(JSON.stringify({ t: "tip", from: presenceIdentity().seed, to: target.seed, amount: TIP_AMOUNT_AE, txHash }));
-  } catch (e) { console.warn("[tip] failed:", e && e.message || e); showTipToast("Tip cancelled / failed"); }
+  } catch (e) {
+    console.warn("[tip] NOT sent (no signed tx):", e && e.message || e);
+    showTipToast("Tip cancelled — nothing sent");   // NO beam, NO relay
+    return;
+  }
+
+  // Only past this point — a genuinely signed + broadcast tx — do we show it.
+  fireTipBeam(myBodyPos(), avatarBodyPos(target.group));
+  showTipToast("Sent " + TIP_AMOUNT_AE + " AE to " + shortName(target.name, 16) + " ✓");
+  // Relay ONLY for REAL tips. A mock tip must never fire a beam on someone
+  // else's screen — that would be a fabricated event in a shared space.
+  if (!isMock && relaySocket && relaySocket.readyState === 1)
+    relaySocket.send(JSON.stringify({ t: "tip", from: presenceIdentity().seed, to: target.seed, amount: TIP_AMOUNT_AE, txHash }));
 }
 function onTipEvent(from, to, amount) {
   const mySeed = presenceIdentity().seed;
@@ -3504,7 +3524,7 @@ function showTipToast(text) {
 }
 tipPromptSend.addEventListener("click", confirmTip);
 tipPromptCancel.addEventListener("click", closeTipPrompt);
-window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, shortName, buildConnectDeeplink, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip, get remoteCount() { return remoteAvatars.size; }, get remoteAvatars() { return remoteAvatars; }, RELAY_URL, get relayReady() { return !!relaySocket && relaySocket.readyState === 1; }, openTipPrompt, confirmTip, get tipBeamCount() { return _tipBeams.length; }, get tipToast() { return { text: tipToast.textContent, shown: tipToast.classList.contains("show") }; }, TIP_AMOUNT_AE };
+window.__wm = { scene, camera, renderer, nodeMesh, nodeData, rig, composer, edgeLines, THREE, source, dataMode, pulses, flareNodeReplay, onDataEvent, labelPool, leaderGeo, mouseNDC, get hoveredNodeIndex() { return hoveredNodeIndex; }, get selectedNodeIndex() { return selectedNodeIndex; }, get dragging() { return dragging; }, get pointerLocked() { return pointerLocked; }, get yaw() { return yaw; }, get pitch() { return pitch; }, get dragPointerId() { return dragPointerId; }, setYaw: (v) => { yaw = v; }, setJoyVec: (x, y) => { joyVec = { x, y }; }, panelMesh, panelLeaderGeo, statusChip, controllerRays, raycaster, selectFromRay, selectNode, get panelNodeIndex() { return panelNodeIndex; }, get panelHistory() { return panelHistory; }, badgeEl, connectDataSource, setConnectionState, get words() { return words; }, searchButtonMesh, searchGroup, searchPanelMesh, keyboardMesh, KEYBOARD_LAYOUT, toggleSearch, openSearch, closeSearch, pressKey, handleSelectRay, selectSearchResult, computeSearchMatches, get searchOpen() { return searchOpen; }, get searchQuery() { return searchQuery; }, get searchMatches() { return searchMatches; }, get teleportAnim() { return teleportAnim; }, addLiveToken, get nodeBySale() { return nodeBySale; }, get activeToastCount() { return _activeToasts.length; }, pollVRControllers, updateVRHover, readStick, controllerLasers, get vrReticle() { return vrReticle; }, get vrHoverIndex() { return vrHoverIndex; }, get flyMode() { return flyMode; }, __testSetSession: (s) => { currentSession = s; }, shortName, buildConnectDeeplink, __testSetRelay: (o) => { relaySocket = o; }, wallet, makeAvatar, drawKeyface, get localAvatar() { return localAvatar; }, btnWallet, identityChip, get remoteCount() { return remoteAvatars.size; }, get remoteAvatars() { return remoteAvatars; }, RELAY_URL, get relayReady() { return !!relaySocket && relaySocket.readyState === 1; }, openTipPrompt, confirmTip, get tipBeamCount() { return _tipBeams.length; }, get tipToast() { return { text: tipToast.textContent, shown: tipToast.classList.contains("show") }; }, TIP_AMOUNT_AE };
 </script>
 </body>
 </html>
