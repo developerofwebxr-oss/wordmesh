@@ -2207,7 +2207,7 @@ searchGroup.add(searchPanelMesh);
 // ---- keyboard: one InstancedMesh (low-poly boxes, one draw call) doubles
 // as the raycast target set — instanceId -> KEYBOARD_LAYOUT[instanceId].
 // Static text labels are pooled sprites (letters never change, painted once).
-const KEY_SIZE = 0.042, KEY_GAP = 0.007;
+const KEY_SIZE = 0.051, KEY_GAP = 0.0085; // ~22% larger than the original tiny 0.042/0.007
 const KEY_STEP = KEY_SIZE + KEY_GAP;
 function buildKeyboardLayout() {
   const rows = ["QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"];
@@ -2258,7 +2258,7 @@ searchGroup.add(keyboardMesh);
 
 function makeKeyLabelSprite(text) {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const size = 48 * dpr;
+  const size = 60 * dpr; // higher-res so letters stay crisp at the larger key scale
   const cnv = document.createElement("canvas");
   cnv.width = size; cnv.height = size;
   const ctx = cnv.getContext("2d");
