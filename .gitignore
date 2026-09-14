@@ -1,3 +1,10 @@
-# Private drafts — never committed (business briefs, notes). A second copy lives
-# outside the repo at ~/dev/_private/wordmesh/.
+# This repo is PUBLIC. Private scratch — never committed (strategy, briefs, notes).
+# A second copy of the preserved brief lives outside the repo at ~/dev/_private/wordmesh/.
 _drafts/
+_private/
+
+# Secrets and key material
+.env
+.env.*
+*.pem
+*.key

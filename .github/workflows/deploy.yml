@@ -19,7 +19,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Runs FIRST. This repo is public: fail before anything builds or deploys if a
+  # strategy-doc filename, a listed business term (docs only) or a secret pattern
+  # is in the tree. Lists: .hygiene-terms, .hygiene-secrets.
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Content guard (no strategy docs, no secrets)
+        run: bash scripts/hygiene-check.sh --all
+
   build:
+    needs: hygiene
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

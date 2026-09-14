@@ -1,0 +1,24 @@
+# .hygiene-terms — words that must not appear in this PUBLIC repo's DOCS.
+#
+# Scanned by scripts/hygiene-check.sh in *.md and *.txt files ONLY — never in
+# index.html / JS / server code, where words like "price" are legitimate app data.
+# One Perl regex per line, matched case-insensitively. Blank lines and lines
+# starting with # are ignored. This file itself is not scanned.
+#
+# A hit fails CI before anything deploys. If a hit is legitimate engineering
+# text, reword the doc or narrow the regex below (and say why in CLAUDE.md) —
+# don't delete the protection.
+
+\bsponsor                 # sponsor, sponsors, sponsorship
+95\s*/\s*5                # a 95/5 split
+gift[\s-]+split
+\bad[\s-]+inventory
+monetiz                   # monetize, monetization
+monetis                   # monetise, monetisation
+\binvestors?\b
+business[\s-]+plan
+go[\s-]+to[\s-]+market
+pitch[\s-]+deck
+\bvaluations?\b           # word-bounded so "evaluation" doesn't trip
+pricing[\s-]+tiers?
+revenue[\s-]+shar(?:e|ing)
