@@ -3450,7 +3450,7 @@ function connectRelay() {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     if (m.t === "presence" && Array.isArray(m.p)) { lastSeen.set(m.id, performance.now()); upsertRemote(m.id, m.p, m.yaw || 0, m.name, m.seed); }
     else if (m.t === "leave") { removeRemote(m.id); lastSeen.delete(m.id); }
-    else if (m.t === "tip") { onTipEvent(m.from, m.to, m.amount); }
+    else if (m.t === "tip") { onRelayTip(m); } // re-proven on chain before any beam
   });
   relaySocket.addEventListener("close", () => { relaySocket = null; clearTimeout(relayReconnect); relayReconnect = setTimeout(connectRelay, 3000); });
   relaySocket.addEventListener("error", () => {});
@@ -3602,7 +3602,7 @@ async function confirmTip() {
   // Relay ONLY for REAL tips. A mock tip must never fire a beam on someone
   // else's screen — that would be a fabricated event in a shared space.
   if (!isMock && relaySocket && relaySocket.readyState === 1)
-    relaySocket.send(JSON.stringify({ t: "tip", from: presenceIdentity().seed, to: target.seed, amount: TIP_AMOUNT_AE, txHash }));
+    relaySocket.send(JSON.stringify({ t: "tip", th: txHash })); // relay derives from/to/amount from the chain
 }
 // Return path for a mobile tip: a real th_ hash came back from the app. Relay so
 // the recipient + onlookers draw the beam (the relay reconnects on this reload,
@@ -3614,7 +3614,7 @@ function completeMobileTip(pend, txHash) {
   let rtries = 0;
   const riv = setInterval(() => {
     if (relaySocket && relaySocket.readyState === 1) {
-      relaySocket.send(JSON.stringify({ t: "tip", from: presenceIdentity().seed, to: pend.seed, amount: pend.amount, txHash }));
+      relaySocket.send(JSON.stringify({ t: "tip", th: txHash })); // relay derives from/to/amount from the chain
       clearInterval(riv);
     } else if (++rtries > 40) clearInterval(riv); // ~6s
   }, 150);
@@ -3633,6 +3633,35 @@ function onTipEvent(from, to, amount) {
   if (to === mySeed) toPos = myBodyPos();
   if (fromPos && toPos) fireTipBeam(fromPos, toPos);
   if (to === mySeed) showTipToast("Received " + amount + " AE from " + shortName(from, 12) + " ✦");
+}
+// Inbound tip from the relay. The relay only forwards chain-verified tips, but a
+// beam claims value moved, so prove it again here (fail closed): the relay's
+// verified flag, a well-formed hash, never twice, and the node itself reports a
+// MINED SpendTx whose sender/recipient/amount match. Anything else → no beam.
+const RELAY_TH_RE = /^th_[1-9A-HJ-NP-Za-km-z]{45,52}$/;
+const aettosToAe = (s) => {
+  const a = BigInt(s), unit = 10n ** 18n;
+  const frac = (a % unit).toString().padStart(18, "0").replace(/0+$/, "");
+  return frac ? `${a / unit}.${frac}` : `${a / unit}`;
+};
+const _relayTipsShown = new Set(), _relayTipsChecking = new Set();
+async function onRelayTip(m) {
+  if (m.verified !== true || typeof m.th !== "string" || !RELAY_TH_RE.test(m.th) || typeof m.from !== "string" || typeof m.to !== "string") return;
+  // marked shown only AFTER it proves out, so a bogus message reusing a real hash can't block the genuine one
+  if (_relayTipsShown.has(m.th) || _relayTipsChecking.has(m.th)) return;
+  _relayTipsChecking.add(m.th);
+  try {
+    const r = await fetch(`${AE_MAINNET}/v3/transactions/${encodeURIComponent(m.th)}`, { cache: "no-store" });
+    if (!r.ok) return;
+    const raw = await r.text(), j = JSON.parse(raw), t = j.tx || {};
+    const aettos = (raw.match(/"amount":\s*(\d+)/) || [])[1]; // raw text: 10 AE = 1e19 aettos, past 2^53
+    if (j.hash !== m.th || !(j.block_height > 0) || t.type !== "SpendTx" || t.sender_id !== m.from || t.recipient_id !== m.to || !aettos || aettosToAe(aettos) !== String(m.amount)) return;
+    if (_relayTipsShown.has(m.th)) return;
+    _relayTipsShown.add(m.th);
+    if (_relayTipsShown.size > 200) _relayTipsShown.delete(_relayTipsShown.values().next().value);
+    onTipEvent(t.sender_id, t.recipient_id, aettosToAe(aettos));
+  } catch { /* no proof → no beam */ }
+  finally { _relayTipsChecking.delete(m.th); }
 }
 const TIP_BEAM_LIFE = 1.4;
 const _tipSparkGeo = new THREE.SphereGeometry(0.14, 10, 10);
