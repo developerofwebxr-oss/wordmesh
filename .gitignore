@@ -8,3 +8,6 @@ _private/
 .env.*
 *.pem
 *.key
+
+# Evidence screenshots go to the PRIVATE vault (~/dev/_private/evidence), never here
+evidence/

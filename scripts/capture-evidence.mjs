@@ -1,15 +1,22 @@
 #!/usr/bin/env node
 // capture-evidence.mjs — standard screenshots of one app version, report-ready.
 //
-//   npm run capture-evidence [-- <label>] [-- --allow-dirty]
+//   npm run capture-evidence [-- <label>] [-- --allow-dirty] [-- --no-push]
 //
 // Serves the repo with `python3 -m http.server`, drives headless Google Chrome
 // over the DevTools Protocol (Node's built-in WebSocket — no Puppeteer/Playwright)
-// and captures a FIXED scene list at two viewports into evidence/<label>/:
+// and captures a FIXED scene list at two viewports:
 //   desktop 1440×900, and mobile 390×844 (DPR 2, touch, Android UA).
-// Label defaults to the git tag on HEAD, else the short sha. Also writes
-// evidence/<label>/manifest.json + DEVICE/README.md and prepends a section to
-// evidence/INDEX.md (newest first). Tooling only; never modifies the app.
+// Label defaults to the git tag on HEAD, else the short sha.
+//
+// OUTPUT NEVER GOES INTO THIS (PUBLIC) REPO. It goes to the private evidence
+// vault — $EVIDENCE_VAULT, default ~/dev/_private/evidence (a git repo whose
+// remote must be PRIVATE) — under wordmesh/<label>/: the PNGs, manifest.json,
+// DEVICE/README.md, plus a newest-first section in wordmesh/INDEX.md. The run
+// then commits that folder in the vault and pushes it, but only after `gh`
+// confirms the vault's GitHub remote is private (--no-push skips the push).
+// The script refuses to write anywhere inside this repo. Tooling only; never
+// modifies the app.
 //
 // Determinism: Math.random is replaced by a fixed-seed PRNG before any page
 // script runs, every scene starts from a fresh load, and camera placement is
@@ -21,13 +28,14 @@
 // wallet is connected (the run aborts if one is); wallet/identity/tip UI is
 // hidden before every capture.
 import { spawn, execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, copyFileSync, mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const EVIDENCE = join(ROOT, "evidence");
+const VAULT = process.env.EVIDENCE_VAULT || join(homedir(), "dev", "_private", "evidence");
+const EVIDENCE = join(VAULT, "wordmesh");
 const PORT = Number(process.env.EVIDENCE_PORT) || 8931;
 const SEED = 20260914;
 const MAX_PNG_BYTES = 300 * 1024;
@@ -157,7 +165,7 @@ const INDEX_HEAD = `# WordMesh evidence index
 Report source: one section per captured version, newest first. Automated captures come from
 \`npm run capture-evidence\` (desktop 1440×900; mobile 390×844, Android UA). Real-device shots
 are added by hand to each version's \`DEVICE/\` folder and listed here on the next capture run.
-Evidence is never deployed (\`evidence/\` is in \`.pages-exclude\`).
+Private vault only — never committed to the public wordmesh repo.
 
 <!-- evidence:sections -->
 `;
@@ -216,9 +224,9 @@ Naming (scene names match the automated captures one folder up):
 - \`android-<scene>.jpg\` — Android Chrome
 
 e.g. \`quest-detail-card-open.jpg\`, \`iphone-search-open.jpg\`. Crop or blur any
-wallet address, balance or other private data before committing — this repo is
-public. Re-run \`npm run capture-evidence -- ${label}\` (or edit evidence/INDEX.md)
-to list them.
+wallet address, balance or other private data before committing — curated shots
+may later be attached to a public release. Re-run
+\`npm run capture-evidence -- ${label}\` (or edit ../INDEX.md) to list them.
 `;
 
 /* ---------------- one-time historical seed ---------------- */
@@ -248,6 +256,39 @@ ${files.length ? files.map((f) => `<img src="pre-v1/${f.file}" width="240" alt="
 `);
 }
 
+/* ---------------- vault ---------------- */
+const vgit = (...a) => execFileSync("git", ["-C", VAULT, ...a], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+function assertVault() {
+  if (!existsSync(VAULT)) throw new Error(`evidence vault not found at ${VAULT} (set EVIDENCE_VAULT)`);
+  const vault = realpathSync(VAULT), repo = realpathSync(ROOT);
+  if (vault === repo || vault.startsWith(repo + "/")) throw new Error(`refusing: vault ${vault} is inside this public repo`);
+  let top; try { top = realpathSync(vgit("rev-parse", "--show-toplevel")); } catch { throw new Error(`${VAULT} is not a git repo`); }
+  if (top === repo) throw new Error("refusing: vault resolves to the wordmesh repo");
+  mkdirSync(EVIDENCE, { recursive: true });
+}
+// GitHub owner/repo of the vault's origin, and whether GitHub reports it private.
+function vaultRemoteIsPrivate() {
+  let url; try { url = vgit("remote", "get-url", "origin"); } catch { return { ok: false, why: "vault has no origin remote" }; }
+  const m = url.match(/github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?$/);
+  if (!m) return { ok: false, why: `origin is not a GitHub repo: ${url}` };
+  try {
+    const v = execFileSync("gh", ["api", `repos/${m[1]}`, "--jq", ".visibility"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    return v === "private" ? { ok: true, repo: m[1] } : { ok: false, why: `${m[1]} visibility is "${v}", not private` };
+  } catch (e) { return { ok: false, why: "couldn't confirm visibility with gh: " + (e.stderr || e.message).toString().trim() }; }
+}
+function commitVault(label, sha, push) {
+  vgit("add", "--", `wordmesh/${label}`, "wordmesh/INDEX.md", ...(existsSync(join(EVIDENCE, "pre-v1")) ? ["wordmesh/pre-v1"] : []));
+  if (!vgit("diff", "--cached", "--name-only")) { console.log("[evidence] vault: nothing new to commit"); return; }
+  const trailer = process.env.EVIDENCE_COMMIT_TRAILER ? `\n\n${process.env.EVIDENCE_COMMIT_TRAILER}` : "";
+  vgit("commit", "-q", "-m", `wordmesh evidence ${label} (${sha.slice(0, 7)})${trailer}`);
+  console.log(`[evidence] vault commit ${vgit("rev-parse", "--short", "HEAD")}`);
+  if (!push) { console.log("[evidence] --no-push: vault NOT pushed"); return; }
+  const vis = vaultRemoteIsPrivate();
+  if (!vis.ok) throw new Error(`vault committed locally but NOT pushed — ${vis.why}`);
+  vgit("push", "-q", "origin", "HEAD");
+  console.log(`[evidence] vault pushed to ${vis.repo} (private)`);
+}
+
 /* ---------------- main ---------------- */
 async function main() {
   const args = process.argv.slice(2);
@@ -260,8 +301,9 @@ async function main() {
   if (dirty.length && !allowDirty) throw new Error(`working tree has uncommitted app/tooling changes — the capture wouldn't match ${sha.slice(0, 7)}:\n${dirty.join("\n")}\n(commit first, or pass --allow-dirty)`);
 
   const outDir = join(EVIDENCE, label);
+  assertVault();
   mkdirSync(join(outDir, "DEVICE"), { recursive: true });
-  console.log(`[evidence] ${label} @ ${sha.slice(0, 7)} → ${relative(ROOT, outDir)}/`);
+  console.log(`[evidence] ${label} @ ${sha.slice(0, 7)} → ${outDir}/`);
 
   const server = spawn("python3", ["-m", "http.server", String(PORT), "--bind", "127.0.0.1"], { cwd: ROOT, stdio: "ignore" });
   const profile = mkdtempSync(join(tmpdir(), "wm-evidence-"));
@@ -328,7 +370,8 @@ async function main() {
     if (!existsSync(join(outDir, "DEVICE", "README.md"))) writeFileSync(join(outDir, "DEVICE", "README.md"), DEVICE_README(label));
     seedPreV1();
     upsertIndexSection(label, indexBody(manifest));
-    console.log(`[evidence] wrote ${relative(ROOT, join(outDir, "manifest.json"))} and evidence/INDEX.md`);
+    console.log(`[evidence] wrote ${join(outDir, "manifest.json")} and ${join(EVIDENCE, "INDEX.md")}`);
+    commitVault(label, sha, !args.includes("--no-push"));
   } finally {
     cdp?.close();
     chrome?.kill();

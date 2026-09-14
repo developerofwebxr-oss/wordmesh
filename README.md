@@ -16,7 +16,7 @@ pre-commit hook (once per clone):
 
     scripts/install-hooks.sh
 
-Evidence screenshots for a version: `npm run capture-evidence` (needs Google Chrome + python3; writes `evidence/<tag or sha>/`, see `evidence/INDEX.md`).
+Evidence screenshots for a version: `npm run capture-evidence` (needs Google Chrome, python3, gh) — output goes to the private evidence vault, never this repo.
 
 The hook is a convenience and can be bypassed (`git commit --no-verify`); the CI
 job is the real gate. Private scratch goes in `_drafts/` or `_private/` (gitignored).
