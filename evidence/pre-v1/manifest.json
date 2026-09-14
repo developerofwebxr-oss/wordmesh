@@ -1,0 +1,12 @@
+{
+  "label": "pre-v1",
+  "historical": true,
+  "structured": false,
+  "note": "Screenshots that existed before the evidence pipeline, copied as-is (not moved). No fixed scenes, viewports or seed.",
+  "searched": [
+    "verification/",
+    "every *.png/*.jpg in the repo tree (excluding .git, evidence, _drafts, _private)"
+  ],
+  "date": "2026-09-14T12:01:37.151Z",
+  "files": []
+}

@@ -1,0 +1,180 @@
+{
+  "label": "d8ffa07",
+  "sha": "d8ffa0745b535992ad0bc65b88a59cef15fd306d",
+  "date": "2026-09-14T12:01:37.145Z",
+  "changes": "Evidence capture pipeline — standard screenshots per version, committed, report-ready.",
+  "seed": 20260914,
+  "relay": "disabled for capture (closed local port)",
+  "data": "live api.superhero.com at capture time",
+  "viewports": [
+    {
+      "name": "desktop",
+      "width": 1440,
+      "height": 900,
+      "dpr": 1,
+      "mobile": false
+    },
+    {
+      "name": "mobile",
+      "width": 390,
+      "height": 844,
+      "dpr": 2,
+      "mobile": true,
+      "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+    }
+  ],
+  "captures": [
+    {
+      "scene": "overview-firstload",
+      "viewport": "desktop",
+      "file": "overview-firstload-desktop.png",
+      "bytes": 272815,
+      "pixels": "1440×900",
+      "privacy": {
+        "hidden": [
+          "#identity-chip",
+          "#tip-prompt",
+          "#tip-toast"
+        ],
+        "remoteAvatarsHidden": 0,
+        "relayConnected": false
+      }
+    },
+    {
+      "scene": "closeup-labels",
+      "viewport": "desktop",
+      "file": "closeup-labels-desktop.png",
+      "bytes": 133012,
+      "pixels": "1440×900",
+      "node": "WORD-CRAFT",
+      "privacy": {
+        "hidden": [
+          "#identity-chip",
+          "#tip-prompt",
+          "#tip-toast"
+        ],
+        "remoteAvatarsHidden": 0,
+        "relayConnected": false
+      }
+    },
+    {
+      "scene": "detail-card-open",
+      "viewport": "desktop",
+      "file": "detail-card-open-desktop.png",
+      "bytes": 277709,
+      "pixels": "1440×900",
+      "node": "AETERNITY",
+      "privacy": {
+        "hidden": [
+          "#identity-chip",
+          "#tip-prompt",
+          "#tip-toast"
+        ],
+        "remoteAvatarsHidden": 0,
+        "relayConnected": false
+      }
+    },
+    {
+      "scene": "search-open",
+      "viewport": "desktop",
+      "file": "search-open-desktop.png",
+      "bytes": 275721,
+      "pixels": "1440×900",
+      "privacy": {
+        "hidden": [
+          "#identity-chip",
+          "#tip-prompt",
+          "#tip-toast"
+        ],
+        "remoteAvatarsHidden": 0,
+        "relayConnected": false
+      }
+    },
+    {
+      "scene": "menu-open",
+      "viewport": "desktop",
+      "skipped": "no menu in this build"
+    },
+    {
+      "scene": "landmarks",
+      "viewport": "desktop",
+      "skipped": "no landmarks in this build"
+    },
+    {
+      "scene": "overview-firstload",
+      "viewport": "mobile",
+      "file": "overview-firstload-mobile.png",
+      "bytes": 292017,
+      "pixels": "780×1688",
+      "privacy": {
+        "hidden": [
+          "#identity-chip",
+          "#tip-prompt",
+          "#tip-toast"
+        ],
+        "remoteAvatarsHidden": 0,
+        "relayConnected": false
+      }
+    },
+    {
+      "scene": "closeup-labels",
+      "viewport": "mobile",
+      "file": "closeup-labels-mobile.png",
+      "bytes": 196373,
+      "pixels": "780×1688",
+      "node": "WORD-CRAFT",
+      "privacy": {
+        "hidden": [
+          "#identity-chip",
+          "#tip-prompt",
+          "#tip-toast"
+        ],
+        "remoteAvatarsHidden": 0,
+        "relayConnected": false
+      }
+    },
+    {
+      "scene": "detail-card-open",
+      "viewport": "mobile",
+      "file": "detail-card-open-mobile.png",
+      "bytes": 279060,
+      "pixels": "624×1350",
+      "node": "AETERNITY",
+      "privacy": {
+        "hidden": [
+          "#identity-chip",
+          "#tip-prompt",
+          "#tip-toast"
+        ],
+        "remoteAvatarsHidden": 0,
+        "relayConnected": false
+      }
+    },
+    {
+      "scene": "search-open",
+      "viewport": "mobile",
+      "file": "search-open-mobile.png",
+      "bytes": 290552,
+      "pixels": "780×1688",
+      "privacy": {
+        "hidden": [
+          "#identity-chip",
+          "#tip-prompt",
+          "#tip-toast"
+        ],
+        "remoteAvatarsHidden": 0,
+        "relayConnected": false
+      }
+    },
+    {
+      "scene": "menu-open",
+      "viewport": "mobile",
+      "skipped": "no menu in this build"
+    },
+    {
+      "scene": "landmarks",
+      "viewport": "mobile",
+      "skipped": "no landmarks in this build"
+    }
+  ]
+}
