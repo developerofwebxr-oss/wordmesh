@@ -1,0 +1,31 @@
+# .pages-exclude — rsync exclude patterns for the GitHub Pages artifact.
+# deploy.yml copies the repo into _site/ with `rsync --exclude-from=.pages-exclude`
+# and publishes ONLY _site/. Anything matching below stays in git but is never
+# served at developerofwebxr-oss.github.io/wordmesh/.
+#
+# The site itself is just index.html + vendor/aepp-sdk.bundle.js (same-origin
+# wallet SDK; everything else loads from CDNs). If you add a file the page
+# loads, make sure it doesn't match a pattern here. If you add a doc, note,
+# brief or backend file, make sure it DOES. deploy.yml also fails the build if
+# a known doc or any *.md reaches _site/.
+
+# Dotfiles and dot-dirs: .git/, .github/, .claude/, .gitignore, .env*, this file
+.*
+
+# All markdown docs, anywhere: CLAUDE.md, WORDMESH_BRIEF.md, HANDOFF*.md, READMEs
+*.md
+
+# Backend — Railway deploys server/ from the repo, never from this artifact
+server/
+
+# Dev-only material
+verification/
+scripts/
+test*/
+node_modules/
+package.json
+package-lock.json
+*.log
+
+# The build output itself (avoid recursive copy)
+_site/

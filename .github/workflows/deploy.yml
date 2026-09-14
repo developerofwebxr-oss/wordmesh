@@ -1,6 +1,8 @@
 name: Deploy to GitHub Pages
 
-# Static single-file site (no build step) — publish the repo root whenever main updates.
+# Static single-file site (no build step). Publishes ONLY _site/ (the repo minus
+# .pages-exclude) whenever main updates — docs, briefs and server/ stay in git
+# but are never served.
 on:
   push:
     branches: [main]
@@ -22,9 +24,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build _site (repo minus .pages-exclude)
+        run: rsync -a --exclude-from=.pages-exclude ./ _site/
+
+      # Fail closed: never publish a doc/backend file, never ship without the app.
+      - name: Guard artifact contents
+        run: |
+          leaks=$(cd _site && find . \( -name '*.md' -o -name '.*' -o -path './server*' \) ! -name '.' -print)
+          if [ -n "$leaks" ]; then echo "::error::Excluded files reached _site:"; echo "$leaks"; exit 1; fi
+          for f in index.html vendor/aepp-sdk.bundle.js; do
+            [ -s "_site/$f" ] || { echo "::error::Required file missing from _site: $f"; exit 1; }
+          done
+          find _site -type f | sort
+
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: .
+          path: _site
 
   deploy:
     needs: build
