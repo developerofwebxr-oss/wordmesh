@@ -1,0 +1,10 @@
+{
+  "name": "wordmesh-tools",
+  "private": true,
+  "description": "Dev tooling only. The site is the static index.html; the relay has its own server/package.json.",
+  "scripts": {
+    "capture-evidence": "node scripts/capture-evidence.mjs",
+    "hooks": "sh scripts/install-hooks.sh",
+    "hygiene": "bash scripts/hygiene-check.sh --all"
+  }
+}

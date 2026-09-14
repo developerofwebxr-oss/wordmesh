@@ -42,7 +42,7 @@ jobs:
       # Fail closed: never publish a doc/backend file, never ship without the app.
       - name: Guard artifact contents
         run: |
-          leaks=$(cd _site && find . \( -name '*.md' -o -name '.*' -o -path './server*' \) ! -name '.' -print)
+          leaks=$(cd _site && find . \( -name '*.md' -o -name '.*' -o -path './server*' -o -path './evidence*' \) ! -name '.' -print)
           if [ -n "$leaks" ]; then echo "::error::Excluded files reached _site:"; echo "$leaks"; exit 1; fi
           for f in index.html vendor/aepp-sdk.bundle.js; do
             [ -s "_site/$f" ] || { echo "::error::Required file missing from _site: $f"; exit 1; }

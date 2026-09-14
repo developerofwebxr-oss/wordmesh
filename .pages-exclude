@@ -19,6 +19,8 @@
 server/
 
 # Dev-only material
+# evidence/: screenshots per version (npm run capture-evidence) — report source, never served
+evidence/
 verification/
 scripts/
 test*/
